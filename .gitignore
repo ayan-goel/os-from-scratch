@@ -1,0 +1,26 @@
+# Build artifacts
+*.o
+*.d
+*.elf
+*.bin
+*.map
+*.dump
+*.img
+kernel.elf
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# Docs — ignore all markdown except README
+*.md
+!README.md
