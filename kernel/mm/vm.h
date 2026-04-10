@@ -78,4 +78,42 @@ void        vm_unmap(pagetable_t pt, uint64_t va, uint64_t size,
 uint64_t    vm_pa_of(pagetable_t pt, uint64_t va);  /* 0 if not mapped */
 void        vm_free(pagetable_t pt, int level);      /* free page table pages */
 
+/*
+ * Per-process pagetable lifecycle (T6.2+).
+ *
+ * vm_clone_kernel() creates a fresh root page whose 512 entries are an exact
+ * copy of kernel_pagetable's root. This means every non-user virtual address
+ * resolves identically through the clone — the intermediate level-1 and
+ * level-0 tables are SHARED between all processes and the kernel. Adding
+ * user mappings in T6.3+ will require clone-on-write of any root entry
+ * whose subtree overlaps the user VA range.
+ *
+ * vm_free_clone() frees the root page back to pmem. It must NOT free any
+ * subtree that's still shared with kernel_pagetable; in T6.2 this is
+ * trivially enforced by the invariant that root entries haven't diverged,
+ * and T6.3+ will add the actual recursive-free path for diverged subtrees.
+ */
+pagetable_t vm_clone_kernel(void);
+void        vm_free_clone(pagetable_t pt);
+
+/*
+ * vm_copy_user_pages — deep-copy all user-mapped pages from src to dst.
+ *
+ * Walks root entries that diverge from kernel_pagetable (i.e., user
+ * subtrees). For each mapped leaf page, allocates a fresh physical page,
+ * copies 4096 bytes, and maps the same VA in dst with the same permissions.
+ * Returns 0 on success, -1 on OOM.
+ */
+int vm_copy_user_pages(pagetable_t dst, pagetable_t src);
+
+/*
+ * vm_teardown_user — free all user-owned subtrees in a pagetable.
+ *
+ * Walks root entries that diverge from kernel_pagetable, tears down the
+ * subtree (freeing physical pages and intermediate tables), and resets
+ * those root entries to match the kernel. After this call, pt has no
+ * user mappings but all kernel mappings are intact.
+ */
+void vm_teardown_user(pagetable_t pt);
+
 #endif /* VM_H */

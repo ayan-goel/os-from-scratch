@@ -5,20 +5,36 @@
 
 /*
  * trap_frame_t — the saved register state pushed onto the kernel stack by
- * machine_trap_vector in trap.S.
+ * machine_trap_vector in arch/trapvec.S.
  *
- * Layout (8-byte slots, matching the sd/ld sequence in trap.S):
- *   slot 0  = x1  (ra)
- *   slot 1  = x2  (sp)   — the value BEFORE the trap vector allocated its frame
- *   slot 2  = x3  (gp)
+ * Layout (8-byte slots, matching the sd/ld sequence in trapvec.S):
+ *   slot  0 = x1  (ra)
+ *   slot  1 = x2  (sp)   — the value BEFORE the trap vector allocated its frame
+ *   slot  2 = x3  (gp)
  *   ...
  *   slot 30 = x31 (t6)
+ *   slot 31 = epc         — saved mepc for per-process save/restore
  *
  * x0 is always zero and is not saved.
+ *
+ * Why 32 slots instead of 31: the RISC-V lp64d ABI requires sp to be
+ * 16-byte aligned at every function-call boundary. When trapvec allocates
+ * a 31-slot (248-byte) frame, sp ends up 8-byte aligned — which happened
+ * to work for the current trap_handler but is a landmine. Adding one
+ * padding slot bumps the frame to 256 bytes so sp stays 16-aligned
+ * through `call trap_handler`. The offsets for x1..x31 are unchanged.
+ *
+ * The _Static_assert pins the total size so the C struct, the asm
+ * register offsets, and the `addi sp, sp, -(32 * 8)` in trapvec.S can't
+ * silently drift apart.
  */
 typedef struct {
-    uint64_t regs[31]; /* x1 ... x31 */
+    uint64_t regs[31];  /* x1 ... x31 (offsets 0..240) */
+    uint64_t epc;       /* slot 31, offset 248 — saved mepc for this process */
 } trap_frame_t;
+
+_Static_assert(sizeof(trap_frame_t) == 32 * 8,
+               "trap_frame_t size must match the save sequence in arch/trapvec.S");
 
 /* Index helpers (register xN maps to regs[N-1]). */
 #define REG_RA   0   /* x1  */

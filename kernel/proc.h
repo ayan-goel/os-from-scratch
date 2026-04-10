@@ -3,6 +3,7 @@
 
 #include "defs.h"
 #include "mm/vm.h"
+#include "trap.h"
 
 /* ── Process state ───────────────────────────────────────────────────────── */
 
@@ -45,8 +46,10 @@ typedef struct {
 
 /* ── Process descriptor ──────────────────────────────────────────────────── */
 
-#define NPROC       64
-#define KSTACK_SIZE 4096   /* 4 KB kernel stack per process */
+#define NPROC              64
+#define KSTACK_SIZE        4096              /* 4 KB kernel stack per process */
+#define USER_TEXT_BASE     0x40000000UL      /* user program text VA */
+#define USER_STACK_OFFSET  0x00100000UL      /* user stack: 1 MB above text */
 
 typedef struct proc {
     proc_state_t  state;
@@ -54,8 +57,11 @@ typedef struct proc {
     struct proc  *parent;
     pagetable_t   pagetable;
     uint64_t      kstack;      /* physical address of top of kernel stack */
+    trap_frame_t *tf;          /* T6.2+: trap frame storage on this proc's kstack */
     context_t     context;     /* saved kernel register context */
+    uint64_t      user_pc;     /* T6.4+: initial mepc for first U-mode entry */
     uint64_t      wake_tick;   /* for SLEEPING: tick at which to wake */
+    int           exit_status; /* T7.4: stored by sys_exit, read by sys_wait */
     char          name[16];
 
     /* T5: kernel-function entry point (replaced by ELF entry in T6). */
@@ -80,10 +86,57 @@ void    proc_free(proc_t *p);     /* ZOMBIE → UNUSED; free kstack + pagetable 
 void    sched(void);              /* yield CPU back to scheduler */
 void    scheduler(void) __attribute__((noreturn));
 
-/* T5: spawn a kernel-function process (replaced by proc_exec in T6). */
+/* T5: spawn a kernel-function process (kept for unit tests; not used in prod). */
 proc_t *proc_spawn_fn(void (*fn)(void), const char *name);
+
+/* T7.2: fork — duplicate the current process. Returns child pid to parent,
+ * 0 to child, or -1 on failure. */
+int proc_fork(void);
+
+/* T7.3: exec — replace current process image with a named binary.
+ * Returns -1 on failure (binary not found); does not return on success. */
+int proc_exec(const char *name, trap_frame_t *frame);
+
+/* Binary table entry for embedded user programs. */
+typedef struct {
+    const char          *name;
+    const unsigned char *data;
+    uint64_t             size;
+} binary_entry_t;
+
+/* Defined in main.c — lookup a binary by name. Returns NULL if not found. */
+const binary_entry_t *binary_lookup(const char *name);
+
+/*
+ * T6.4: Load a raw (objcopy -O binary) user program into a fresh proc.
+ *
+ *   bin      — pointer to the raw binary bytes (embedded in kernel image)
+ *   size     — length of the binary in bytes
+ *   entry_va — user virtual address where the binary's first byte lands;
+ *              also the initial mepc. Must be page-aligned.
+ *   name     — process name (copied into p->name, truncated to 15 chars)
+ *
+ * Allocates text pages, copies the binary, allocates a user stack, sets
+ * up the trap frame with user sp and entry point, and arms context.ra =
+ * proc_return_to_user so the first schedule of this proc drops to U-mode.
+ */
+proc_t *proc_exec_static(const void *bin, uint64_t size,
+                         uint64_t entry_va, const char *name);
+
+/*
+ * T6.4: First-time trampoline into user mode. Entered via context.ra on
+ * the first scheduling of a freshly-exec'd proc. Sets mepc/mstatus/mscratch
+ * and tail-calls user_return (asm) to install satp and mret. Never returns.
+ */
+void proc_return_to_user(void) __attribute__((noreturn));
 
 /* Defined in switch.S */
 void switch_context(context_t *old, context_t *new);
+
+/* Defined in arch/trapvec.S — final leg of first user-mode entry.
+ *   a0 = trap frame pointer
+ *   a1 = satp value (MAKE_SATP of p->pagetable)
+ * Never returns. */
+void user_return(trap_frame_t *tf, uint64_t satp) __attribute__((noreturn));
 
 #endif /* PROC_H */

@@ -20,6 +20,7 @@
 #include "mm/vm.h"
 #include "dev/uart.h"
 #include "defs.h"
+#include "arch/riscv.h"
 
 proc_t  proc_table[NPROC];
 proc_t *current = NULL;
@@ -66,10 +67,21 @@ proc_t *proc_alloc(void) {
             panic("proc_alloc: out of memory for kernel stack");
         p->kstack = (uint64_t)kstack_page + KSTACK_SIZE; /* top of stack */
 
-        /* Inherit the kernel page table. Process-specific user mappings
-         * are added by proc_exec (T6). For now, use the kernel pagetable
-         * directly (no per-process pagetable yet in T5). */
-        p->pagetable = kernel_pagetable;
+        /*
+         * Per-process pagetable (T6.2+).
+         *
+         * Each process gets its own root page that mirrors the kernel's
+         * mappings. T6.3+ will install user-VA mappings into this root.
+         * In T6.2 the clone is still functionally identical to the kernel
+         * pagetable, but we pre-allocate it now so the T6.3 transition is
+         * a one-line change in proc_exec_static.
+         */
+        p->pagetable = vm_clone_kernel();
+        KASSERT(p->pagetable != kernel_pagetable,
+                "proc_alloc: clone returned the kernel root itself");
+        KASSERT(vm_pa_of(p->pagetable, PHYS_BASE) ==
+                vm_pa_of(kernel_pagetable, PHYS_BASE),
+                "proc_alloc: clone doesn't see kernel RAM");
 
         return p;
     }
@@ -80,8 +92,12 @@ void proc_free(proc_t *p) {
     /* Free the kernel stack page. kstack points to the top; subtract KSTACK_SIZE. */
     pmem_free((void *)(p->kstack - KSTACK_SIZE));
 
-    /* In T6+ we'll free the process's own page table here.
-     * For T5, pagetable == kernel_pagetable so we must not free it. */
+    /* Release the cloned pagetable. vm_free_clone enforces the T6.2
+     * invariant that no root entry has diverged from the kernel root
+     * yet — that assertion will start firing the moment T6.3 starts
+     * adding user mappings, at which point we'll wire the recursive
+     * teardown path. */
+    vm_free_clone(p->pagetable);
 
     memzero_struct(p, sizeof(proc_t));
     p->state = UNUSED;
@@ -157,6 +173,305 @@ proc_t *proc_spawn_fn(void (*fn)(void), const char *name) {
     return p;
 }
 
+/* ── fork (T7.2) ──────────────────────────────────────────────────────────── */
+
+/*
+ * proc_fork — duplicate the current process.
+ *
+ * Allocates a new slot, deep-copies the user address space, copies the
+ * trap frame (so the child resumes at the instruction after the ecall),
+ * and marks the child RUNNABLE.
+ *
+ * Returns: child pid to parent, 0 to child (via trap frame), -1 on error.
+ */
+int proc_fork(void) {
+    proc_t *child = proc_alloc();
+    if (child == NULL)
+        return -1;
+
+    /* Copy the user address space page-by-page. */
+    if (vm_copy_user_pages(child->pagetable, current->pagetable) < 0) {
+        proc_free(child);
+        return -1;
+    }
+
+    /* Carve the child's trap frame from the top of its kernel stack. */
+    child->tf = (trap_frame_t *)(child->kstack - sizeof(trap_frame_t));
+
+    /* Copy the parent's trap frame into the child's. */
+    {
+        uint64_t *dst = (uint64_t *)child->tf;
+        uint64_t *src = (uint64_t *)current->tf;
+        for (uint64_t i = 0; i < sizeof(trap_frame_t) / 8; i++)
+            dst[i] = src[i];
+    }
+
+    /* fork returns 0 to the child. */
+    child->tf->regs[REG_A0] = 0;
+
+    /* Child resumes at the instruction after the ecall (already advanced
+     * by trap.c before syscall_dispatch). Using tf->epc, NOT user_pc
+     * (which is the original entry point from exec). */
+    child->user_pc = current->tf->epc;
+
+    /* Metadata. */
+    child->parent = current;
+    for (int i = 0; i < 16; i++)
+        child->name[i] = current->name[i];
+
+    /* First schedule of the child enters proc_return_to_user. */
+    child->context.ra = (uint64_t)proc_return_to_user;
+    child->context.sp = (uint64_t)child->tf;
+
+    child->state = RUNNABLE;
+    return child->pid;
+}
+
+/* ── exec (T7.3) ──────────────────────────────────────────────────────────── */
+
+/*
+ * proc_exec — replace the current process's image with a new binary.
+ *
+ * Tears down old user mappings, loads the named binary, resets the trap
+ * frame for a fresh start, and updates frame->epc so the ecall return
+ * path in trap.c jumps to the new entry point instead of the old code.
+ *
+ * Returns -1 if the binary is not found. On success, does not return to
+ * the original code — but does return to syscall_dispatch, which returns
+ * to trap_handler, which mrets to the new entry point.
+ */
+int proc_exec(const char *name, trap_frame_t *frame) {
+    const binary_entry_t *bin = binary_lookup(name);
+    if (bin == NULL)
+        return -1;
+
+    /* Tear down old user mappings (text + stack pages). */
+    vm_teardown_user(current->pagetable);
+
+    /* Load new binary — same logic as proc_exec_static's inner body. */
+    uint64_t text_pages = (bin->size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t pg = 0; pg < text_pages; pg++) {
+        void *phys = pmem_alloc();
+        if (phys == NULL)
+            panic("proc_exec: oom mapping text");
+
+        uint64_t off = pg * PAGE_SIZE;
+        uint64_t to_copy = bin->size - off;
+        if (to_copy > PAGE_SIZE) to_copy = PAGE_SIZE;
+
+        const uint8_t *src = bin->data + off;
+        uint8_t       *dst = (uint8_t *)phys;
+        for (uint64_t j = 0; j < to_copy; j++)       dst[j] = src[j];
+        for (uint64_t j = to_copy; j < PAGE_SIZE; j++) dst[j] = 0;
+
+        if (vm_map(current->pagetable, USER_TEXT_BASE + off, (uint64_t)phys,
+                   PAGE_SIZE, PTE_USER_RX) < 0)
+            panic("proc_exec: vm_map text failed");
+    }
+
+    /* Allocate and map a fresh user stack. */
+    void *stack_phys = pmem_alloc();
+    if (stack_phys == NULL)
+        panic("proc_exec: oom user stack");
+    {
+        uint8_t *sp = (uint8_t *)stack_phys;
+        for (uint64_t j = 0; j < PAGE_SIZE; j++) sp[j] = 0;
+    }
+
+    uint64_t user_stack_va = USER_TEXT_BASE + USER_STACK_OFFSET;
+    if (vm_map(current->pagetable, user_stack_va, (uint64_t)stack_phys,
+               PAGE_SIZE, PTE_USER_RW) < 0)
+        panic("proc_exec: vm_map stack failed");
+
+    /* Zero the trap frame and set up the new user state.
+     * frame and current->tf alias the same memory. */
+    {
+        uint64_t *words = (uint64_t *)current->tf;
+        for (uint64_t j = 0; j < sizeof(trap_frame_t) / 8; j++)
+            words[j] = 0;
+    }
+    current->tf->regs[REG_SP] = user_stack_va + PAGE_SIZE;
+    current->user_pc = USER_TEXT_BASE;
+
+    /* Update frame->epc so the ecall return path in trap.c writes the
+     * new entry point to mepc. The new binary starts at _start. */
+    frame->epc = USER_TEXT_BASE;
+
+    /* Copy the new name. */
+    {
+        int i = 0;
+        while (name[i] && i < 15) { current->name[i] = name[i]; i++; }
+        current->name[i] = '\0';
+    }
+
+    return 0;  /* trap.c writes this into frame->regs[REG_A0], but the
+                * new binary won't see it — it starts fresh at _start. */
+}
+
+/* ── User-mode first entry (T6.4+) ─────────────────────────────────────── */
+
+/*
+ * proc_return_to_user — first-time entry into user mode.
+ *
+ * Called via context.ra on the first schedule of a fresh exec'd proc.
+ * By the time we're here:
+ *   - current points to the proc
+ *   - sp points somewhere on the proc's kernel stack (context.sp was set
+ *     by proc_exec_static to p->tf; the prologue pushed below that)
+ *   - mscratch is 0 (sentinel — we're still in kernel context)
+ *
+ * Sets up the CSRs the hardware needs to mret into user mode, then
+ * tail-calls user_return (asm) to do the GPR restore and mret. user_return
+ * does not return, so this function is marked noreturn.
+ *
+ * Subsequent trap→handler→mret cycles go through trapvec.S's _from_user
+ * path directly; this trampoline runs exactly once per proc.
+ */
+void proc_return_to_user(void) {
+    proc_t *p = current;
+    KASSERT(p != NULL, "proc_return_to_user: current is NULL");
+    KASSERT(p->tf != NULL, "proc_return_to_user: no trap frame");
+
+    /*
+     * CRITICAL SECTION: disable interrupts before modifying mepc/mstatus.
+     *
+     * The scheduler runs with MIE=1, so a timer interrupt can fire at any
+     * point in this function. If an interrupt fires AFTER we write mepc
+     * (the user entry point) but BEFORE the mret in user_return, the
+     * hardware's trap-entry sequence overwrites mepc with the interrupted
+     * PC (a kernel address). The timer handler's mret then returns to
+     * proc_return_to_user with the original MPP=U intact (it gets saved
+     * by the hardware and restored by mret). When user_return's mret
+     * finally executes, mepc still holds the stale kernel PC, so the CPU
+     * jumps to a kernel address in U-mode → instruction access fault.
+     *
+     * Fix: clear MIE now. MPIE=1 ensures mret re-enables interrupts
+     * atomically at the privilege transition. Between here and the mret,
+     * no interrupts can fire, so mepc and mscratch stay exactly as we
+     * set them.
+     */
+    CSR_CLEAR(mstatus, MSTATUS_MIE);
+
+    /* Where mret will jump. Now safe from clobbering. */
+    CSR_WRITE(mepc, p->user_pc);
+
+    /*
+     * mstatus: MPP = U (mret returns to user mode), MPIE = 1 (mret
+     * re-enables interrupts). MIE stays 0 (already cleared above).
+     */
+    uint64_t mstatus;
+    CSR_READ(mstatus, mstatus);
+    mstatus &= ~MSTATUS_MPP_M;   /* clear MPP field (bits [12:11]) */
+    mstatus |= MSTATUS_MPP_U;    /* MPP = 00 (user) */
+    mstatus |= MSTATUS_MPIE;     /* MIE ← MPIE on mret → interrupts on */
+    CSR_WRITE(mstatus, mstatus);
+
+    /* Arm the mscratch swap so the next trap from user lands on the
+     * kernel stack. p->kstack holds the top address. */
+    CSR_WRITE(mscratch, p->kstack);
+
+    /* Final leg in asm: install satp, restore user GPRs, mret. */
+    user_return(p->tf, MAKE_SATP(p->pagetable));
+
+    /* Unreachable. */
+    panic("proc_return_to_user: user_return returned");
+}
+
+/*
+ * proc_exec_static — load a raw (non-ELF) user binary into a fresh proc.
+ *
+ * Memory layout installed in the proc's pagetable:
+ *   [entry_va,               entry_va + text_pages*PAGE_SIZE)    R+X+U
+ *   [entry_va + USER_STACK_OFF, entry_va + USER_STACK_OFF + PAGE_SIZE) R+W+U
+ *
+ * We place the text and stack in the same 1 GB root-entry slot so one
+ * clone-on-write (or in our case, no CoW at all since we chose entry_va
+ * in an unused root slot) suffices. The user stack is a single page,
+ * initial sp at its top.
+ */
+
+proc_t *proc_exec_static(const void *bin, uint64_t size,
+                         uint64_t entry_va, const char *name) {
+    KASSERT((entry_va & (PAGE_SIZE - 1)) == 0,
+            "proc_exec_static: entry_va not page-aligned");
+
+    proc_t *p = proc_alloc();
+    if (p == NULL)
+        panic("proc_exec_static: no free slots");
+
+    /* Copy the name (up to 15 chars + NUL). */
+    int i = 0;
+    while (name[i] && i < 15) { p->name[i] = name[i]; i++; }
+    p->name[i] = '\0';
+
+    /* Map and populate the text pages. */
+    uint64_t text_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t pg = 0; pg < text_pages; pg++) {
+        void *phys = pmem_alloc();
+        if (phys == NULL)
+            panic("proc_exec_static: oom mapping text");
+
+        /* Copy this page's slice of the binary; zero any trailing bytes. */
+        uint64_t off = pg * PAGE_SIZE;
+        uint64_t to_copy = size - off;
+        if (to_copy > PAGE_SIZE) to_copy = PAGE_SIZE;
+
+        const uint8_t *src = (const uint8_t *)bin + off;
+        uint8_t       *dst = (uint8_t *)phys;
+        for (uint64_t j = 0; j < to_copy; j++)       dst[j] = src[j];
+        for (uint64_t j = to_copy; j < PAGE_SIZE; j++) dst[j] = 0;
+
+        if (vm_map(p->pagetable, entry_va + off, (uint64_t)phys,
+                   PAGE_SIZE, PTE_USER_RX) < 0)
+            panic("proc_exec_static: vm_map text failed");
+    }
+
+    /* Allocate and map the user stack (one page, initially zeroed). */
+    void *stack_phys = pmem_alloc();
+    if (stack_phys == NULL)
+        panic("proc_exec_static: oom user stack");
+    {
+        uint8_t *sp = (uint8_t *)stack_phys;
+        for (uint64_t j = 0; j < PAGE_SIZE; j++) sp[j] = 0;
+    }
+
+    uint64_t user_stack_va = entry_va + USER_STACK_OFFSET;
+    if (vm_map(p->pagetable, user_stack_va, (uint64_t)stack_phys,
+               PAGE_SIZE, PTE_USER_RW) < 0)
+        panic("proc_exec_static: vm_map stack failed");
+
+    /* Carve the trap frame out of the top of the kernel stack. The frame
+     * size (256 bytes, see trap.h) leaves p->kstack - 256 == 16-aligned. */
+    p->tf = (trap_frame_t *)(p->kstack - sizeof(trap_frame_t));
+
+    /* Zero the frame so user regs start clean. */
+    {
+        uint64_t *words = (uint64_t *)p->tf;
+        for (uint64_t j = 0; j < sizeof(trap_frame_t) / 8; j++)
+            words[j] = 0;
+    }
+
+    /* User sp starts at the top of the user stack page. */
+    p->tf->regs[REG_SP] = user_stack_va + PAGE_SIZE;
+
+    /* Record the user entry point; proc_return_to_user writes it to mepc. */
+    p->user_pc = entry_va;
+
+    /*
+     * Initial kernel context. When the scheduler first schedules this
+     * proc, switch_context loads context.sp/ra and rets into
+     * proc_return_to_user.
+     *
+     * context.sp = p->tf so the C prologue pushes below the trap frame
+     * (not into it). p->tf is 16-byte aligned, so sp is ABI-compliant.
+     */
+    p->context.ra = (uint64_t)proc_return_to_user;
+    p->context.sp = (uint64_t)p->tf;
+
+    p->state = RUNNABLE;
+    return p;
+}
+
 /*
  * scheduler — the main scheduling loop. Runs in the kmain stack context.
  * Never returns.
@@ -172,24 +487,44 @@ void scheduler(void) {
     uart_puts("scheduler: starting\n");
 
     for (;;) {
+        /*
+         * Enable interrupts while scanning for runnable processes.
+         * Trap entry (from user or kernel) clears MIE. After every
+         * process yields/sleeps/exits, the scheduler inherits MIE=0
+         * from the last switch_context. Without re-enabling MIE here,
+         * timer interrupts can't fire, sleeping processes never wake,
+         * and the scheduler deadlocks.
+         *
+         * Disable MIE before switch_context into a process so the
+         * process's trap handler starts with a known MIE state.
+         */
+        CSR_SET(mstatus, MSTATUS_MIE);
+
         int found = 0;
         for (int i = 0; i < NPROC; i++) {
             proc_t *p = &proc_table[i];
+
+            /* Reap parentless zombies. */
+            if (p->state == ZOMBIE && p->parent == NULL) {
+                proc_free(p);
+                continue;
+            }
+
             if (p->state != RUNNABLE)
                 continue;
 
             found = 1;
             p->state = RUNNING;
             current  = p;
+            CSR_CLEAR(mstatus, MSTATUS_MIE);
             switch_context(&scheduler_context, &p->context);
-            /*
-             * The process called sched() and we're back here.
-             * current is already NULL (set by sched before switching).
-             */
+            /* Back from sched(). current is NULL. Re-enable MIE
+             * for the next iteration's scan + wfi. */
+            CSR_SET(mstatus, MSTATUS_MIE);
         }
 
         if (!found) {
-            /* Nothing to run — idle. */
+            /* Idle — MIE already set above. wfi wakes on timer. */
             __asm__ volatile("wfi");
         }
     }

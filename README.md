@@ -1,6 +1,6 @@
 # os-from-scratch
 
-> *"Most OS schedulers use fixed heuristics (round-robin quantum, MLFQ priority decay) that were tuned decades ago. Can a scheduler that models per-process behavior online make better decisions on modern workloads? I built a kernel from scratch to find out."*
+> *Most OS schedulers use fixed heuristics (round-robin quantum, MLFQ priority decay) that were tuned decades ago. Can a scheduler that models per-process behavior online make better decisions on modern workloads? I built a kernel from scratch to find out.*
 
 A RISC-V kernel in C, built from bare metal, ending in an online-learning process scheduler evaluated against round-robin and MLFQ baselines.
 

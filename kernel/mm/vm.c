@@ -174,6 +174,165 @@ void vm_free(pagetable_t pt, int level) {
     pmem_free(pt);
 }
 
+/* ── Per-process pagetable cloning ───────────────────────────────────────── */
+
+/*
+ * vm_clone_kernel — allocate a new root and copy kernel_pagetable's 512
+ * root entries verbatim.
+ *
+ * Why a memcpy-equivalent of the root is enough: the root has 512 entries,
+ * each covering a 1 GB slice of VA space. Every slice currently in use
+ * (RAM at 0x80000000, UART/CLINT at 0x02000000 and 0x10000000) is fully
+ * described by an entry that points to a level-1 table. Copying the entry
+ * makes the clone reuse the same level-1 subtree as the kernel, which is
+ * fine as long as the clone doesn't try to edit that subtree.
+ *
+ * T6.3+ adds user mappings in the low VA range, which shares a root entry
+ * with the UART/CLINT subtree. At that point vm_clone_kernel's callers
+ * will need to clone-on-write the conflicting root entry before inserting
+ * user PTEs. For T6.2, no caller yet modifies the clone's table, so simple
+ * copy semantics are correct.
+ */
+pagetable_t vm_clone_kernel(void) {
+    pagetable_t pt = vm_create();   /* pmem_alloc returns a zeroed page */
+    for (int i = 0; i < 512; i++)
+        pt[i] = kernel_pagetable[i];
+    return pt;
+}
+
+/*
+ * vm_free_subtree — recursively tear down a page table subtree that is
+ * owned entirely by one process (not shared with the kernel).
+ *
+ * Frees both the physical data pages at leaves AND the intermediate
+ * page table pages. Call on the level-1 table pointed to by a diverged
+ * root entry.
+ *
+ * level=1: entries are either branches to level-0 tables or (shouldn't
+ *          happen) 2 MB superpages.
+ * level=0: entries are leaf 4 KB page mappings.
+ */
+static void vm_free_subtree(pagetable_t pt, int level) {
+    for (int i = 0; i < 512; i++) {
+        pte_t pte = pt[i];
+        if (!(pte & PTE_V))
+            continue;
+
+        if (level > 0 && !(pte & (PTE_R | PTE_W | PTE_X))) {
+            /* Branch PTE — recurse into the next-level table. */
+            vm_free_subtree((pagetable_t)PTE2PA(pte), level - 1);
+        } else {
+            /* Leaf PTE (4 KB page or superpage). Free the physical page. */
+            pmem_free((void *)PTE2PA(pte));
+        }
+        pt[i] = 0;
+    }
+    pmem_free(pt);
+}
+
+/*
+ * vm_free_clone — release a per-process cloned pagetable.
+ *
+ * Walks the 512 root entries. Entries that still match kernel_pagetable
+ * are shared kernel subtrees — skip them (do NOT free). Entries that
+ * diverge are process-private user subtrees — tear them down completely
+ * via vm_free_subtree, which frees both physical data pages and
+ * intermediate page table pages.
+ *
+ * Finally frees the root page itself.
+ */
+void vm_free_clone(pagetable_t pt) {
+    for (int i = 0; i < 512; i++) {
+        if (pt[i] == kernel_pagetable[i])
+            continue;   /* shared kernel subtree — hands off */
+        if (pt[i] & PTE_V) {
+            /* Diverged entry — process owns this subtree. */
+            vm_free_subtree((pagetable_t)PTE2PA(pt[i]), 1);
+        }
+    }
+    pmem_free(pt);
+}
+
+/*
+ * vm_teardown_user — remove all user mappings from a cloned pagetable.
+ *
+ * Used by exec to tear down the old address space before loading a new
+ * binary. After this call, pt is equivalent to a freshly cloned kernel
+ * pagetable — ready for new vm_map calls.
+ */
+void vm_teardown_user(pagetable_t pt) {
+    for (int i = 0; i < 512; i++) {
+        if (pt[i] == kernel_pagetable[i])
+            continue;
+        if (pt[i] & PTE_V)
+            vm_free_subtree((pagetable_t)PTE2PA(pt[i]), 1);
+        pt[i] = kernel_pagetable[i];
+    }
+}
+
+/*
+ * vm_copy_user_pages — deep-copy all user-mapped pages from src to dst.
+ *
+ * Walks root entries of src that differ from kernel_pagetable (user-owned
+ * subtrees). For each valid leaf PTE, allocates a new physical page,
+ * copies 4096 bytes from the source PA, and maps the same VA in dst with
+ * the same permission bits.
+ *
+ * The walk reconstructs full VAs from the three VPN indices. We iterate
+ * levels 2→1→0 manually rather than using pte_walk for each VA because
+ * we don't know which VAs are mapped without a full scan.
+ *
+ * Returns 0 on success, -1 on OOM (dst may be partially populated — the
+ * caller must tear it down via vm_free_clone on failure).
+ */
+int vm_copy_user_pages(pagetable_t dst, pagetable_t src) {
+    for (int i2 = 0; i2 < 512; i2++) {
+        if (src[i2] == kernel_pagetable[i2])
+            continue;   /* shared kernel subtree — skip */
+        if (!(src[i2] & PTE_V))
+            continue;
+
+        pagetable_t l1 = (pagetable_t)PTE2PA(src[i2]);
+        for (int i1 = 0; i1 < 512; i1++) {
+            if (!(l1[i1] & PTE_V))
+                continue;
+            if (l1[i1] & (PTE_R | PTE_W | PTE_X)) {
+                /* 2 MB superpage — shouldn't exist, skip defensively. */
+                continue;
+            }
+
+            pagetable_t l0 = (pagetable_t)PTE2PA(l1[i1]);
+            for (int i0 = 0; i0 < 512; i0++) {
+                pte_t pte = l0[i0];
+                if (!(pte & PTE_V))
+                    continue;
+
+                /* Reconstruct the full VA from the three VPN indices. */
+                uint64_t va = ((uint64_t)i2 << 30) |
+                              ((uint64_t)i1 << 21) |
+                              ((uint64_t)i0 << 12);
+
+                uint64_t src_pa = PTE2PA(pte);
+                uint64_t perm = pte & (PTE_R | PTE_W | PTE_X | PTE_U);
+
+                void *new_page = pmem_alloc();
+                if (new_page == NULL)
+                    return -1;
+
+                /* Copy the page contents. */
+                uint8_t *s = (uint8_t *)src_pa;
+                uint8_t *d = (uint8_t *)new_page;
+                for (uint64_t b = 0; b < PAGE_SIZE; b++)
+                    d[b] = s[b];
+
+                if (vm_map(dst, va, (uint64_t)new_page, PAGE_SIZE, perm) < 0)
+                    return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* ── W^X self-test ───────────────────────────────────────────────────────── */
 
 /*
