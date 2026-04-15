@@ -86,6 +86,12 @@ void    proc_free(proc_t *p);     /* ZOMBIE → UNUSED; free kstack + pagetable 
 void    sched(void);              /* yield CPU back to scheduler */
 void    scheduler(void) __attribute__((noreturn));
 
+/*
+ * P2.3: find a process by pid. Returns NULL if no slot has that pid,
+ * or the slot is UNUSED. O(NPROC) linear scan.
+ */
+proc_t *proc_find_by_pid(int pid);
+
 /* T5: spawn a kernel-function process (kept for unit tests; not used in prod). */
 proc_t *proc_spawn_fn(void (*fn)(void), const char *name);
 
@@ -94,18 +100,9 @@ proc_t *proc_spawn_fn(void (*fn)(void), const char *name);
 int proc_fork(void);
 
 /* T7.3: exec — replace current process image with a named binary.
- * Returns -1 on failure (binary not found); does not return on success. */
+ * Returns -1 on failure (binary not found); does not return on success.
+ * The binary is looked up in the ramfs via fs_lookup (kernel/fs.h). */
 int proc_exec(const char *name, trap_frame_t *frame);
-
-/* Binary table entry for embedded user programs. */
-typedef struct {
-    const char          *name;
-    const unsigned char *data;
-    uint64_t             size;
-} binary_entry_t;
-
-/* Defined in main.c — lookup a binary by name. Returns NULL if not found. */
-const binary_entry_t *binary_lookup(const char *name);
 
 /*
  * T6.4: Load a raw (objcopy -O binary) user program into a fresh proc.

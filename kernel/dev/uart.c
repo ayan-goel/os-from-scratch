@@ -5,11 +5,13 @@
  * Registers are 1 byte wide, spaced 1 byte apart.
  *
  * Relevant registers (offsets from base):
- *   0x00  RBR/THR  Receive buffer / Transmit holding register
- *   0x05  LSR      Line status register
- *                    bit 5 (THRE): 1 = transmit holding register is empty (safe to write)
+ *   0x00  RBR/THR  Receive Buffer (read) / Transmit Holding (write)
+ *   0x05  LSR      Line Status Register
+ *                    bit 0 (DR)  : 1 = RX FIFO has a byte ready to read
+ *                    bit 5 (THRE): 1 = TX holding register is empty (safe to write)
  *
- * We do not enable interrupts here — polling only for Phase 0.
+ * We do not enable interrupts here — polling only. The TX path spins on
+ * THRE, and the RX path is drained by the timer handler on every tick.
  */
 
 #include "dev/uart.h"
@@ -17,12 +19,14 @@
 #define UART_BASE       0x10000000UL
 
 /* Register offsets. */
+#define UART_RBR        0   /* Receive Buffer Register (read) */
 #define UART_THR        0   /* Transmit Holding Register (write) */
 #define UART_IER        1   /* Interrupt Enable Register */
 #define UART_FCR        2   /* FIFO Control Register */
 #define UART_LCR        3   /* Line Control Register */
 #define UART_LSR        5   /* Line Status Register */
 
+#define UART_LSR_DR     (1 << 0)   /* RX data ready */
 #define UART_LSR_THRE   (1 << 5)   /* Transmit holding register empty */
 
 /* MMIO accessor — volatile to prevent the compiler from caching reads/writes. */
@@ -61,4 +65,34 @@ void uart_puthex64(uint64_t val) {
         int nibble = (val >> i) & 0xF;
         uart_putc(nibble < 10 ? '0' + nibble : 'a' + (nibble - 10));
     }
+}
+
+int uart_getc(void) {
+    if (!(uart[UART_LSR] & UART_LSR_DR))
+        return -1;
+    return (int)uart[UART_RBR];
+}
+
+void uart_write_raw(const char *buf, uint64_t len) {
+    for (uint64_t i = 0; i < len; i++) {
+        while (!(uart[UART_LSR] & UART_LSR_THRE))
+            ;
+        uart[UART_THR] = (unsigned char)buf[i];
+    }
+}
+
+void uart_putdec(uint64_t val) {
+    /* Worst-case 20 digits for a 64-bit unsigned. */
+    char buf[21];
+    int i = 0;
+    if (val == 0) {
+        uart_putc('0');
+        return;
+    }
+    while (val > 0 && i < 20) {
+        buf[i++] = (char)('0' + (val % 10));
+        val /= 10;
+    }
+    while (i > 0)
+        uart_putc(buf[--i]);
 }

@@ -7,6 +7,7 @@
 
 #include "trap.h"
 #include "syscall.h"
+#include "shell.h"
 #include "proc.h"
 #include "mm/vm.h"
 #include "dev/clint.h"
@@ -84,6 +85,13 @@ void trap_handler(trap_frame_t *frame) {
             if (p->state == SLEEPING && ticks >= p->wake_tick)
                 p->state = RUNNABLE;
         }
+
+        /* P2.1: drain the UART RX FIFO into the shell's input ring.
+         * We're in M-mode with interrupts disabled and no one else is
+         * racing us for the UART, so a simple loop is safe. */
+        int c;
+        while ((c = uart_getc()) >= 0)
+            shell_rx_push((uint8_t)c);
 
 #ifdef TRAP_DEBUG_TICK
         uart_puts("tick\n");

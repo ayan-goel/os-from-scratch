@@ -35,6 +35,11 @@ KERNEL_C_SRCS   := kernel/main.c \
                    kernel/trap.c \
                    kernel/proc.c \
                    kernel/syscall.c \
+                   kernel/ring.c \
+                   kernel/io.c \
+                   kernel/shell.c \
+                   kernel/tui.c \
+                   kernel/fs.c \
                    kernel/dev/uart.c \
                    kernel/dev/clint.c \
                    kernel/mm/pmem.c \

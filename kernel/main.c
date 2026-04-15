@@ -14,6 +14,10 @@
 #include "mm/vm.h"
 #include "mm/kalloc.h"
 #include "proc.h"
+#include "fs.h"
+#include "io.h"
+#include "shell.h"
+#include "tui.h"
 
 /* ── panic ──────────────────────────────────────────────────────────────────
  * Print a message and halt the CPU permanently.
@@ -31,44 +35,10 @@ void panic(const char *msg) {
         __asm__ volatile("wfi");
 }
 
-/* ── Embedded user programs ──────────────────────────────────────────────── */
-
 /*
- * User programs are compiled from user/ sources, linked at 0x40000000, stripped
- * to raw binaries, and re-wrapped as ELF .o files by objcopy. The symbols
- * are mangled from the input filename (e.g. user/hello.bin → _binary_user_hello_bin_*).
+ * Embedded user programs and the ramfs table live in kernel/fs.c. kmain
+ * just calls fs_init before spawning init.
  */
-extern const unsigned char _binary_user_init_bin_start[];
-extern const unsigned char _binary_user_init_bin_end[];
-extern const unsigned char _binary_user_hello_bin_start[];
-extern const unsigned char _binary_user_hello_bin_end[];
-extern const unsigned char _binary_user_cpu_bound_bin_start[];
-extern const unsigned char _binary_user_cpu_bound_bin_end[];
-extern const unsigned char _binary_user_io_bound_bin_start[];
-extern const unsigned char _binary_user_io_bound_bin_end[];
-
-/* ── Binary lookup table ────────────────────────────────────────────────── */
-
-static int kstrcmp(const char *a, const char *b) {
-    while (*a && *a == *b) { a++; b++; }
-    return (unsigned char)*a - (unsigned char)*b;
-}
-
-static binary_entry_t binary_table[] = {
-    { "init",      _binary_user_init_bin_start,      0 },
-    { "hello",     _binary_user_hello_bin_start,     0 },
-    { "cpu_bound", _binary_user_cpu_bound_bin_start, 0 },
-    { "io_bound",  _binary_user_io_bound_bin_start,  0 },
-};
-#define NBINARIES (sizeof(binary_table) / sizeof(binary_table[0]))
-
-const binary_entry_t *binary_lookup(const char *name) {
-    for (uint64_t i = 0; i < NBINARIES; i++) {
-        if (kstrcmp(binary_table[i].name, name) == 0)
-            return &binary_table[i];
-    }
-    return NULL;
-}
 
 /* ── kmain ───────────────────────────────────────────────────────────────── */
 void kmain(unsigned int hart_id, unsigned long dtb_ptr) {
@@ -138,19 +108,25 @@ void kmain(unsigned int hart_id, unsigned long dtb_ptr) {
     /* 9. Process table. */
     proc_init();
 
-    /* 10. Fill in binary table sizes (can't use pointer arithmetic in
-     * static initializers for extern symbols). */
-    binary_table[0].size = (uint64_t)(_binary_user_init_bin_end      - _binary_user_init_bin_start);
-    binary_table[1].size = (uint64_t)(_binary_user_hello_bin_end     - _binary_user_hello_bin_start);
-    binary_table[2].size = (uint64_t)(_binary_user_cpu_bound_bin_end - _binary_user_cpu_bound_bin_start);
-    binary_table[3].size = (uint64_t)(_binary_user_io_bound_bin_end  - _binary_user_io_bound_bin_start);
+    /* 10. Initialize the ramfs and the global output ring. */
+    fs_init();
+    io_init();
 
-    /* 11. Spawn the init process. It fork/execs the workloads. */
+    /* 11. Spawn the init process. It fork/execs the workloads.
+     *     Init's output lands in output_ring (via sys_write), where
+     *     the TUI (spawned next) renders it into the shell panel. */
     {
-        const binary_entry_t *init = binary_lookup("init");
+        const inode_t *init = fs_lookup("init");
         KASSERT(init != NULL, "kmain: init binary not found");
         proc_exec_static(init->data, init->size, USER_TEXT_BASE, "init");
     }
+
+    /* 12. Spawn the kernel-mode shell thread. */
+    proc_spawn_fn(shell_thread, "shell");
+
+    /* 13. Spawn the TUI renderer. Takes over the terminal once it
+     *     draws its first frame. */
+    proc_spawn_fn(tui_thread, "tui");
 
     /* Enter the scheduler. Never returns. */
     scheduler();

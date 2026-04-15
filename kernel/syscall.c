@@ -9,6 +9,7 @@
 #include "syscall.h"
 #include "proc.h"
 #include "trap.h"
+#include "io.h"
 #include "dev/uart.h"
 #include "defs.h"
 
@@ -58,12 +59,17 @@ static int64_t sys_write(uint64_t fd, uint64_t buf_va, uint64_t len) {
     if (fd != 1)
         return -1;
 
+    /*
+     * P2.4: redirect stdout to the global output_ring instead of
+     * writing directly to the UART. The TUI renderer draws the ring
+     * contents into the shell panel on every frame. Keeps user
+     * process output from clobbering the dashboard.
+     */
     for (uint64_t i = 0; i < len; i++) {
         uint64_t pa = vm_pa_of(current->pagetable, buf_va + i);
         if (pa == 0)
             return -1;   /* unmapped user address */
-        char c = *(char *)pa;
-        uart_putc(c);
+        ring_push(&output_ring, *(uint8_t *)pa);
     }
     return (int64_t)len;
 }

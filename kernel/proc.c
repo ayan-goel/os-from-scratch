@@ -16,6 +16,7 @@
  */
 
 #include "proc.h"
+#include "fs.h"
 #include "mm/pmem.h"
 #include "mm/vm.h"
 #include "dev/uart.h"
@@ -86,6 +87,15 @@ proc_t *proc_alloc(void) {
         return p;
     }
     return NULL; /* no free slots */
+}
+
+proc_t *proc_find_by_pid(int pid) {
+    for (int i = 0; i < NPROC; i++) {
+        proc_t *p = &proc_table[i];
+        if (p->state != UNUSED && p->pid == pid)
+            return p;
+    }
+    return NULL;
 }
 
 void proc_free(proc_t *p) {
@@ -241,8 +251,8 @@ int proc_fork(void) {
  * to trap_handler, which mrets to the new entry point.
  */
 int proc_exec(const char *name, trap_frame_t *frame) {
-    const binary_entry_t *bin = binary_lookup(name);
-    if (bin == NULL)
+    const inode_t *bin = fs_lookup(name);
+    if (bin == NULL || bin->type != FT_BINARY)
         return -1;
 
     /* Tear down old user mappings (text + stack pages). */
