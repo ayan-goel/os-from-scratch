@@ -72,6 +72,11 @@ run_one() {
     #   set quantum (RR uses it; MLFQ ignores per design),
     #   switch to the requested scheduler,
     #   clear trace, spawn workload, wait, dump, idle.
+    # QEMU exit protocol: after the trace dump, send Ctrl-A X
+    # (0x01 0x78), QEMU's documented "stop the emulator" sequence.
+    # The perl alarm is a fallback in case Ctrl-A X doesn't fire (e.g.
+    # the kernel's input handling is wedged) — but the typical path is
+    # a clean exit, not a timeout.
     {
         sleep "${BOOT_WAIT}"
         printf 'quantum %d\n' "${q}"
@@ -84,14 +89,16 @@ run_one() {
         sleep "${RUN_TIME}"
         printf 'trace 1024\n'
         sleep "${TAIL_WAIT}"
+        printf '\x01x'         # Ctrl-A X — QEMU exits cleanly
     } | perl -e "
         \$|=1;
-        \$SIG{ALRM}=sub{ kill 'TERM', \$pid; exit };
+        \$SIG{ALRM}=sub{ kill 'KILL', \$pid; exit };
         \$pid = open(Q, '-|', 'qemu-system-riscv64 -machine virt -cpu rv64 ' .
                               '-m 128M -nographic -bios none -kernel ${KERNEL} 2>&1');
         alarm ${TOTAL};
         while (<Q>) { print }
-    " > "${raw}"
+        alarm 0;
+    " > "${raw}" || true
 
     perl -pe 's/\e\[[0-9;?]*[a-zA-Z]//g; s/\r//g' "${raw}" > "${log}"
 
