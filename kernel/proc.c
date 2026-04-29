@@ -17,14 +17,27 @@
 
 #include "proc.h"
 #include "fs.h"
+#include "trace.h"
 #include "mm/pmem.h"
 #include "mm/vm.h"
 #include "dev/uart.h"
 #include "defs.h"
 #include "arch/riscv.h"
 
+extern volatile uint64_t ticks;   /* defined in trap.c */
+
 proc_t  proc_table[NPROC];
 proc_t *current = NULL;
+
+/*
+ * T5 (Phase 3): global count of scheduling decisions.
+ *
+ * Incremented on every sched() call, including preempt, yield, sleep, and
+ * exit. Used by the `stats` command and the live TUI scheduler panel.
+ * Per-process burst_count disappears when slots are freed; this global
+ * persists for the whole run.
+ */
+uint64_t sched_total_decisions = 0;
 
 /* The scheduler's own saved context. */
 static context_t scheduler_context;
@@ -59,8 +72,9 @@ proc_t *proc_alloc(void) {
             continue;
 
         memzero_struct(p, sizeof(proc_t));
-        p->state = EMBRYO;
-        p->pid   = next_pid++;
+        p->state      = EMBRYO;
+        p->pid        = next_pid++;
+        p->start_tick = (uint32_t)ticks;
 
         /* Allocate a kernel stack for this process. */
         void *kstack_page = pmem_alloc();
@@ -122,6 +136,17 @@ void proc_free(proc_t *p) {
  */
 void sched(void) {
     proc_t *p = current;
+
+    /* T3: close the running burst before leaving the CPU. */
+    uint32_t burst = (uint32_t)ticks - p->burst_start_tick;
+    p->last_burst = burst;
+    p->burst_sum += burst;
+    p->burst_count++;
+
+    /* T5: count the scheduling decision globally so stats can report
+     * overall throughput even after processes exit and free their slots. */
+    sched_total_decisions++;
+
     current = NULL;
     switch_context(&p->context, &scheduler_context);
     /* Execution resumes here next time this process is scheduled. */
@@ -234,6 +259,7 @@ int proc_fork(void) {
     child->context.sp = (uint64_t)child->tf;
 
     child->state = RUNNABLE;
+    trace_emit(EV_SPAWN, child->pid);
     return child->pid;
 }
 
@@ -479,6 +505,7 @@ proc_t *proc_exec_static(const void *bin, uint64_t size,
     p->context.sp = (uint64_t)p->tf;
 
     p->state = RUNNABLE;
+    trace_emit(EV_SPAWN, p->pid);
     return p;
 }
 
@@ -525,6 +552,17 @@ void scheduler(void) {
 
             found = 1;
             p->state = RUNNING;
+            if (p->first_run_tick == 0)
+                p->first_run_tick = (uint32_t)ticks;
+            p->burst_start_tick = (uint32_t)ticks;   /* T3: open burst */
+            /*
+             * T6: trace RUN only for user processes. The shell yields
+             * at ~1.7M/s; tracing its picks would flood the 16K ring
+             * inside a few ms. Kernel threads (init_fn != NULL) are
+             * infrastructure, not subjects of scheduler measurement.
+             */
+            if (p->init_fn == 0)
+                trace_emit(EV_RUN, p->pid);
             current  = p;
             CSR_CLEAR(mstatus, MSTATUS_MIE);
             switch_context(&scheduler_context, &p->context);

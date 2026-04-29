@@ -24,3 +24,6 @@ kernel.elf
 # Docs — ignore all markdown except README
 *.md
 !README.md
+results/
+tasks/
+notes/

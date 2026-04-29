@@ -19,6 +19,14 @@ extern const unsigned char _binary_user_cpu_bound_bin_start[];
 extern const unsigned char _binary_user_cpu_bound_bin_end[];
 extern const unsigned char _binary_user_io_bound_bin_start[];
 extern const unsigned char _binary_user_io_bound_bin_end[];
+extern const unsigned char _binary_user_spin_bin_start[];
+extern const unsigned char _binary_user_spin_bin_end[];
+extern const unsigned char _binary_user_mixed_bin_start[];
+extern const unsigned char _binary_user_mixed_bin_end[];
+extern const unsigned char _binary_user_bursty_bin_start[];
+extern const unsigned char _binary_user_bursty_bin_end[];
+extern const unsigned char _binary_user_forker_bin_start[];
+extern const unsigned char _binary_user_forker_bin_end[];
 
 /* ── Text files ──────────────────────────────────────────────────── */
 static const char readme_text[] =
@@ -43,6 +51,10 @@ inode_t ramfs[] = {
     { "hello",     _binary_user_hello_bin_start,     0, FT_BINARY },
     { "cpu_bound", _binary_user_cpu_bound_bin_start, 0, FT_BINARY },
     { "io_bound",  _binary_user_io_bound_bin_start,  0, FT_BINARY },
+    { "spin",      _binary_user_spin_bin_start,      0, FT_BINARY },
+    { "mixed",     _binary_user_mixed_bin_start,     0, FT_BINARY },
+    { "bursty",    _binary_user_bursty_bin_start,    0, FT_BINARY },
+    { "forker",    _binary_user_forker_bin_start,    0, FT_BINARY },
     { "README",    (const unsigned char *)readme_text,
       sizeof(readme_text) - 1, FT_TEXT },
 };
@@ -61,7 +73,11 @@ void fs_init(void) {
     ramfs[1].size = (uint64_t)(_binary_user_hello_bin_end     - _binary_user_hello_bin_start);
     ramfs[2].size = (uint64_t)(_binary_user_cpu_bound_bin_end - _binary_user_cpu_bound_bin_start);
     ramfs[3].size = (uint64_t)(_binary_user_io_bound_bin_end  - _binary_user_io_bound_bin_start);
-    /* ramfs[4] is README — size is already set via sizeof at declaration. */
+    ramfs[4].size = (uint64_t)(_binary_user_spin_bin_end      - _binary_user_spin_bin_start);
+    ramfs[5].size = (uint64_t)(_binary_user_mixed_bin_end     - _binary_user_mixed_bin_start);
+    ramfs[6].size = (uint64_t)(_binary_user_bursty_bin_end    - _binary_user_bursty_bin_start);
+    ramfs[7].size = (uint64_t)(_binary_user_forker_bin_end    - _binary_user_forker_bin_start);
+    /* ramfs[8] is README — size is already set via sizeof at declaration. */
 }
 
 const inode_t *fs_lookup(const char *name) {

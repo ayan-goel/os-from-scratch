@@ -50,11 +50,13 @@ void out_puthex64(uint64_t v) {
 /* ── Kernel-thread helpers ───────────────────────────────────────── */
 
 void kernel_yield(void) {
+    current->voluntary_yields++;
     current->state = RUNNABLE;
     sched();
 }
 
 void kernel_sleep(uint64_t ticks_to_sleep) {
+    current->sleep_calls++;
     current->wake_tick = ticks + ticks_to_sleep;
     current->state = SLEEPING;
     sched();

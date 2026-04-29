@@ -18,7 +18,9 @@
 #include "io.h"
 #include "fs.h"
 #include "proc.h"
+#include "trace.h"
 #include "dev/clint.h"
+#include "dev/uart.h"
 #include "defs.h"
 
 extern volatile uint64_t ticks;   /* from trap.c */
@@ -99,6 +101,7 @@ static void cmd_help(void) {
     out_puts("  stats             print scheduler statistics\n");
     out_puts("  sched <name>      hot-swap scheduler (stub)\n");
     out_puts("  quantum [ms]      show/set timer quantum (stub)\n");
+    out_puts("  trace [n|clear]   dump last n events (default 64), or clear ring\n");
     out_puts("  clear             clear the shell output panel\n");
 }
 
@@ -107,23 +110,96 @@ static void cmd_clear(void) {
 }
 
 static void cmd_stats(void) {
-    int ready = 0, running = 0, sleeping = 0, zombie = 0;
+    /*
+     * Header: global scheduler state. decisions/sec is a coarse estimate
+     * over the whole run (ticks = 10 ms each → decisions * 100 / ticks).
+     * Fine-grained rates come from parse_trace.py on a trace dump.
+     */
+    out_puts("sched: round-robin  quantum=");
+    out_putdec(timer_interval / 10000);
+    out_puts("ms  ticks=");
+    out_putdec(ticks);
+    out_puts("  decisions=");
+    out_putdec(sched_total_decisions);
+    uint64_t dps = (ticks > 0) ? (sched_total_decisions * 100 / ticks) : 0;
+    out_puts("  dec/s=");
+    out_putdec(dps);
+    out_putc('\n');
+
+    /*
+     * Per-process row. Columns chosen to fit inside the 80-col output
+     * panel: pid(3) name(10) st(3) cpu(5) bursts(5) avg(3) yld(4) prp(4) slp(4).
+     * Leading spaces + 1-space separators push the total to ~72 chars.
+     */
+    out_puts("pid name       st   cpu bursts avg yld prp slp\n");
     for (int i = 0; i < NPROC; i++) {
-        switch (proc_table[i].state) {
-        case RUNNABLE: ready++;    break;
-        case RUNNING:  running++;  break;
-        case SLEEPING: sleeping++; break;
-        case ZOMBIE:   zombie++;   break;
-        default: break;
+        proc_t *p = &proc_table[i];
+        if (p->state == UNUSED)
+            continue;
+
+        /* pid (3 right-aligned). */
+        int pid_digits = 1;
+        for (int n = p->pid; n >= 10; n /= 10) pid_digits++;
+        for (int s = 0; s < 3 - pid_digits; s++) out_putc(' ');
+        out_putdec((uint64_t)p->pid);
+        out_putc(' ');
+
+        /* name (10 left-padded). */
+        int nl = 0;
+        while (nl < 10 && p->name[nl]) { out_putc(p->name[nl]); nl++; }
+        for (int s = nl; s < 10; s++) out_putc(' ');
+        out_putc(' ');
+
+        /* state (3). */
+        out_puts(state_tag(p->state));
+        out_putc(' ');
+
+        /* cpu_ticks (5 right). */
+        {
+            uint64_t v = p->cpu_ticks;
+            int d = 1;
+            for (uint64_t n = v; n >= 10; n /= 10) d++;
+            for (int s = 0; s < 5 - d; s++) out_putc(' ');
+            out_putdec(v);
         }
+        out_putc(' ');
+
+        /* burst_count (6 right). */
+        {
+            uint64_t v = p->burst_count;
+            int d = 1;
+            for (uint64_t n = v; n >= 10; n /= 10) d++;
+            for (int s = 0; s < 6 - d; s++) out_putc(' ');
+            out_putdec(v);
+        }
+        out_putc(' ');
+
+        /* avg burst length (3 right). Integer division, 0 when no bursts. */
+        {
+            uint64_t avg = p->burst_count ? (p->burst_sum / p->burst_count) : 0;
+            int d = 1;
+            for (uint64_t n = avg; n >= 10; n /= 10) d++;
+            for (int s = 0; s < 3 - d; s++) out_putc(' ');
+            out_putdec(avg);
+        }
+        out_putc(' ');
+
+        /* yld / prp / slp (each 3 right + space). */
+        {
+            uint64_t vals[3] = { p->voluntary_yields,
+                                  p->involuntary_preempts,
+                                  p->sleep_calls };
+            for (int k = 0; k < 3; k++) {
+                uint64_t v = vals[k];
+                int d = 1;
+                for (uint64_t n = v; n >= 10; n /= 10) d++;
+                for (int s = 0; s < 3 - d; s++) out_putc(' ');
+                out_putdec(v);
+                if (k < 2) out_putc(' ');
+            }
+        }
+        out_putc('\n');
     }
-    out_puts("scheduler: round-robin\n");
-    out_puts("  quantum:  "); out_putdec(TIMER_INTERVAL / 10000); out_puts(" ms\n");
-    out_puts("  ticks:    "); out_putdec(ticks); out_putc('\n');
-    out_puts("  running:  "); out_putdec((uint64_t)running);  out_putc('\n');
-    out_puts("  runnable: "); out_putdec((uint64_t)ready);    out_putc('\n');
-    out_puts("  sleeping: "); out_putdec((uint64_t)sleeping); out_putc('\n');
-    out_puts("  zombie:   "); out_putdec((uint64_t)zombie);   out_putc('\n');
 }
 
 static void cmd_sched(const char *arg) {
@@ -131,13 +207,129 @@ static void cmd_sched(const char *arg) {
     out_puts("sched: hot-swap not implemented until Phase 4 (MLFQ)\n");
 }
 
-static void cmd_quantum(const char *arg) {
-    if (*arg == '\0') {
-        out_puts("quantum: "); out_putdec(TIMER_INTERVAL / 10000);
-        out_puts(" ms (read-only until Phase 4)\n");
+/*
+ * cmd_trace(arg) — dump the tail of the trace ring as ASCII lines.
+ *
+ * Default dumps the most recent 64 entries; `trace N` dumps the last N
+ * (capped at 1024). Records are written straight to the UART via
+ * uart_puts, NOT through out_puts/output_ring. Reason: the TUI only
+ * repaints the last ~9 lines of the output ring into the shell panel
+ * every frame, so a burst of 40+ trace records would scroll off-panel
+ * before rendering and never reach QEMU stdout. The kernel-direct
+ * uart_puts path lands raw bytes in stdout verbatim (interleaved with
+ * TUI cursor-position sequences that the ANSI stripper in
+ * parse_trace.py handles). A brief one-line ack goes to the shell
+ * panel so the user knows the command ran.
+ *
+ * Format:
+ *   TRACE tick=0x00001234 pid=0x05 ev=RUN
+ *
+ * `TRACE` is the grep anchor for tools/parse_trace.py. Event names
+ * must match these spellings exactly — the parser is name-driven.
+ */
+static void uart_hex_fixed(uint64_t v, int digits) {
+    for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4) {
+        int n = (int)((v >> shift) & 0xF);
+        uart_putc((char)(n < 10 ? '0' + n : 'a' + (n - 10)));
+    }
+}
+
+static const char *ev_name(uint8_t type) {
+    switch (type) {
+    case EV_SPAWN:   return "SPAWN";
+    case EV_EXIT:    return "EXIT";
+    case EV_RUN:     return "RUN";
+    case EV_YIELD:   return "YIELD";
+    case EV_PREEMPT: return "PREEMPT";
+    case EV_SLEEP:   return "SLEEP";
+    case EV_WAKE:    return "WAKE";
+    default:         return "?";
+    }
+}
+
+static void cmd_trace(const char *arg) {
+    /* `trace clear` — wipe the ring so a subsequent experiment starts
+     * with a clean slate (init's boot-time spawns won't pollute the
+     * sample). Echoed via uart_puts so the experiment harness can grep
+     * for confirmation regardless of TUI scroll. */
+    if (str_eq(arg, "clear")) {
+        trace_reset();
+        out_puts("trace: cleared\n");
+        uart_puts("trace: cleared\n");
         return;
     }
-    out_puts("quantum: dynamic adjust not implemented until Phase 4\n");
+
+    uint64_t want = 64;
+    if (*arg) {
+        int parsed = katoi(arg);
+        if (parsed <= 0) {
+            out_puts("trace: bad count\n");
+            return;
+        }
+        want = (uint64_t)parsed;
+    }
+    if (want > 1024)
+        want = 1024;
+
+    uint64_t start, count;
+    trace_total(&start, &count);
+    if (count == 0) {
+        out_puts("trace: ring empty\n");
+        return;
+    }
+
+    uint64_t end = start + count;            /* exclusive */
+    uint64_t first = (count > want) ? (end - want) : start;
+
+    for (uint64_t idx = first; idx < end; idx++) {
+        trace_event_t e;
+        if (!trace_get(idx, &e))
+            continue;
+        uart_puts("TRACE tick=0x");
+        uart_hex_fixed((uint64_t)e.tick, 8);
+        uart_puts(" pid=0x");
+        uart_hex_fixed((uint64_t)e.pid, 2);
+        uart_puts(" ev=");
+        uart_puts(ev_name(e.type));
+        uart_putc('\n');
+    }
+
+    /* Shell-panel ack so the user sees something happened. */
+    out_puts("trace: dumped ");
+    out_putdec(end - first);
+    out_puts(" events (see stdout)\n");
+}
+
+/*
+ * cmd_quantum — show/set the scheduling quantum in milliseconds.
+ *
+ * No arg: prints the current value. With arg: parses an integer in
+ * 1..100 ms, multiplies by 10000 (CLINT clock = 10 MHz → 10000 ticks
+ * per ms), and writes timer_interval. The new value takes effect at
+ * the next timer rearm — bounded by the OLD quantum, so worst case is
+ * one stale tick before the change applies.
+ */
+static void cmd_quantum(const char *arg) {
+    if (*arg == '\0') {
+        out_puts("quantum: ");
+        out_putdec(timer_interval / 10000);
+        out_puts(" ms\n");
+        return;
+    }
+    int ms = katoi(arg);
+    if (ms < 1 || ms > 100) {
+        out_puts("quantum: out of range (valid: 1..100 ms)\n");
+        return;
+    }
+    timer_interval = (uint64_t)ms * 10000ULL;
+    out_puts("quantum: set to ");
+    out_putdec((uint64_t)ms);
+    out_puts(" ms\n");
+    /* Also echo to UART so a scripted run captures the change in the
+     * raw log (the output ring scrolls under busy workloads). */
+    uart_puts("quantum: set to ");
+    uart_putdec((uint64_t)ms);
+    uart_puts(" ms\n");
 }
 
 static void cmd_ls(void) {
@@ -307,6 +499,7 @@ static void shell_exec_command(char *line) {
     if (str_eq(line, "stats"))   { cmd_stats();       return; }
     if (str_eq(line, "sched"))   { cmd_sched(arg);    return; }
     if (str_eq(line, "quantum")) { cmd_quantum(arg);  return; }
+    if (str_eq(line, "trace"))   { cmd_trace(arg);    return; }
 
     out_puts("unknown command: ");
     out_puts(line);

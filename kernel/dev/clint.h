@@ -12,15 +12,19 @@
  * mtime >= mtimecmp[hart].
  *
  * The CLINT clock runs at 10 MHz (100 ns per tick) regardless of CPU speed.
- * So TIMER_INTERVAL ticks = TIMER_INTERVAL / 10,000,000 seconds.
+ * So `timer_interval` ticks = `timer_interval` / 10,000,000 seconds.
  *
- * TIMER_INTERVAL = 100,000 → 10 ms between interrupts (scheduling quantum).
+ * `timer_interval` is a runtime variable so the shell's `quantum <ms>`
+ * command can change the scheduling quantum live. Initial value is
+ * 100000 (10 ms). Changes take effect on the next clint_set_timer call,
+ * which happens once per timer interrupt — so latency is bounded by the
+ * old quantum.
  */
 #define CLINT_BASE          0x2000000ULL
 #define CLINT_MTIMECMP(h)   (*(volatile uint64_t *)(CLINT_BASE + 0x4000 + (h) * 8))
 #define CLINT_MTIME         (*(volatile uint64_t *)(CLINT_BASE + 0xBFF8))
 
-#define TIMER_INTERVAL      100000ULL    /* 10 ms at 10 MHz */
+extern volatile uint64_t timer_interval;
 
 void clint_init(void);
 void clint_set_timer(void);

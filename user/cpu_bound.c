@@ -11,10 +11,12 @@ __attribute__((section(".text.boot")))
 void _start(void) {
     int pid = getpid();
 
+    /* Inner count bumped ~100x vs Phase 1/2 so a single instance burns
+     * multiple seconds of CPU time — enough for ≥500 scheduler decisions
+     * at a 10 ms quantum. See SPEC.md §Phase 3. */
     for (int round = 0; round < 5; round++) {
-        /* Busy work — burn CPU cycles without yielding. */
         volatile int x = 0;
-        for (int i = 0; i < 100000; i++)
+        for (int i = 0; i < 10000000; i++)
             x += i;
 
         puts("cpu_bound pid=");

@@ -9,6 +9,7 @@
 #include "syscall.h"
 #include "shell.h"
 #include "proc.h"
+#include "trace.h"
 #include "mm/vm.h"
 #include "dev/clint.h"
 #include "dev/uart.h"
@@ -79,11 +80,21 @@ void trap_handler(trap_frame_t *frame) {
         clint_set_timer();
         ticks++;
 
+        /* T2 (Phase 3): charge this tick to whoever was RUNNING. Counts
+         * both user processes and kernel threads (shell, tui). */
+        if (current != NULL && current->state == RUNNING)
+            current->cpu_ticks++;
+
         /* T6.5: wake sleeping processes whose wake_tick has arrived. */
         for (int i = 0; i < NPROC; i++) {
             proc_t *p = &proc_table[i];
-            if (p->state == SLEEPING && ticks >= p->wake_tick)
+            if (p->state == SLEEPING && ticks >= p->wake_tick) {
                 p->state = RUNNABLE;
+                /* Skip kernel-thread wakes (tui) — we don't trace
+                 * their RUN or SLEEP either; matching events only. */
+                if (p->init_fn == 0)
+                    trace_emit(EV_WAKE, p->pid);
+            }
         }
 
         /* P2.1: drain the UART RX FIFO into the shell's input ring.
@@ -98,7 +109,9 @@ void trap_handler(trap_frame_t *frame) {
 #endif
         /* Preempt the current user process if one is running. */
         if (is_user && current != NULL && current->state == RUNNING) {
+            current->involuntary_preempts++;
             current->state = RUNNABLE;
+            trace_emit(EV_PREEMPT, current->pid);
             sched();
             /* Returned from scheduler — this process was rescheduled. */
             restore_user_csrs(frame);

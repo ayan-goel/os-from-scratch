@@ -67,6 +67,21 @@ typedef struct proc {
     /* T5: kernel-function entry point (replaced by ELF entry in T6). */
     void (*init_fn)(void);
 
+    /* T2 (Phase 3): per-process CPU accounting.
+     * Ticks are 10 ms each; uint32 overflows after ~500 days — fine. */
+    uint32_t cpu_ticks;       /* timer ticks charged to this proc while RUNNING */
+    uint32_t start_tick;      /* value of `ticks` at proc_alloc time */
+    uint32_t first_run_tick;  /* tick of first RUNNABLE→RUNNING edge, 0 if never */
+
+    /* T3 (Phase 3): burst + scheduling-event counters. */
+    uint32_t burst_start_tick;    /* set on RUNNABLE→RUNNING; zero when not running */
+    uint32_t burst_sum;           /* sum of all completed-burst lengths (ticks) */
+    uint32_t burst_count;         /* number of completed bursts */
+    uint32_t last_burst;          /* most recent burst length (ticks) */
+    uint32_t voluntary_yields;    /* sys_yield / kernel_yield calls */
+    uint32_t involuntary_preempts;/* timer-driven preemptions */
+    uint32_t sleep_calls;         /* sys_sleep / kernel_sleep calls */
+
     /*
      * Scheduler-specific accounting fields are added as each scheduler phase
      * needs them. See SPEC.md §4 Phase 3/5 for the staging plan.
@@ -77,6 +92,10 @@ typedef struct proc {
 
 extern proc_t  proc_table[NPROC];
 extern proc_t *current;           /* process currently running, or NULL */
+
+/* T5 (Phase 3): total scheduling decisions across the kernel's lifetime.
+ * Incremented in sched(); read by `stats` and the TUI sched panel. */
+extern uint64_t sched_total_decisions;
 
 /* ── API ─────────────────────────────────────────────────────────────────── */
 

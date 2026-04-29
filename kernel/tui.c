@@ -228,7 +228,37 @@ static void tui_draw_procs(void) {
     }
 }
 
+/*
+ * Rolling 1-second window for ctx-switch rate.
+ *
+ * Sampled once per TUI frame (~50 ms at 20 fps). The buffer holds 20
+ * slots (≈ 1 second). Each frame, we record (decisions, ticks) at the
+ * write head and compute the rate as (newest - oldest) decisions over
+ * (newest - oldest) ticks, scaled to per-second (100 ticks/sec).
+ *
+ * Until the buffer fills with real samples, the head and tail refer to
+ * the same boot-time zero — rate stays 0 for the first second of life.
+ */
+#define SCHED_WINDOW 20
+static uint64_t win_dec  [SCHED_WINDOW];
+static uint64_t win_ticks[SCHED_WINDOW];
+static int      win_head = 0;
+static int      win_filled = 0;
+
 static void tui_draw_sched(void) {
+    /* Sample the rolling window. */
+    win_dec  [win_head] = sched_total_decisions;
+    win_ticks[win_head] = ticks;
+    int oldest = (win_head + 1) % SCHED_WINDOW;
+    if (!win_filled && win_head == SCHED_WINDOW - 1)
+        win_filled = 1;
+    int tail = win_filled ? oldest : 0;
+
+    uint64_t dec_delta  = win_dec  [win_head] - win_dec  [tail];
+    uint64_t tick_delta = win_ticks[win_head] - win_ticks[tail];
+    uint64_t cps = (tick_delta > 0) ? (dec_delta * 100 / tick_delta) : 0;
+    win_head = (win_head + 1) % SCHED_WINDOW;
+
     /* Rows 3-12, cols 41-80. Width = 40. */
     ansi_goto(3, 41);
     tui_write(" SCHEDULER");
@@ -239,8 +269,10 @@ static void tui_draw_sched(void) {
     clear_to(40 - 26);
 
     ansi_goto(5, 41);
-    tui_write("   quantum   : 10 ms");
-    clear_to(40 - 20);
+    tui_write("   quantum   : ");
+    write_int_field(timer_interval / 10000, 4);
+    tui_write(" ms");
+    clear_to(40 - 24);
 
     ansi_goto(6, 41);
     tui_write("   ticks     : ");
@@ -260,8 +292,18 @@ static void tui_draw_sched(void) {
     write_int_field((uint64_t)ready, 10);
     clear_to(40 - 25);
 
-    /* Blank rows 8-12. */
-    for (int r = 8; r <= 12; r++) {
+    ansi_goto(8, 41);
+    tui_write("   decisions : ");
+    write_int_field(sched_total_decisions, 10);
+    clear_to(40 - 25);
+
+    ansi_goto(9, 41);
+    tui_write("   ctx sw/s  : ");
+    write_int_field(cps, 10);
+    clear_to(40 - 25);
+
+    /* Blank rows 10-12. */
+    for (int r = 10; r <= 12; r++) {
         ansi_goto(r, 41);
         clear_to(40);
     }

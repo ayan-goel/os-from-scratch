@@ -10,6 +10,7 @@
 #include "proc.h"
 #include "trap.h"
 #include "io.h"
+#include "trace.h"
 #include "dev/uart.h"
 #include "defs.h"
 
@@ -28,9 +29,12 @@ static void sys_exit(int64_t status) {
     current->state = ZOMBIE;
 
     /* Wake parent if it's blocked in wait(). */
-    if (current->parent != NULL && current->parent->state == SLEEPING)
+    if (current->parent != NULL && current->parent->state == SLEEPING) {
         current->parent->state = RUNNABLE;
+        trace_emit(EV_WAKE, current->parent->pid);
+    }
 
+    trace_emit(EV_EXIT, current->pid);
     sched();
     panic("sys_exit: returned from sched after zombie");
 }
@@ -92,7 +96,9 @@ static int64_t sys_getpid(void) {
  * trapvec.S's _from_user restore + mret.
  */
 static void sys_yield(void) {
+    current->voluntary_yields++;
     current->state = RUNNABLE;
+    trace_emit(EV_YIELD, current->pid);
     sched();
 }
 
@@ -105,8 +111,10 @@ static void sys_yield(void) {
  * has arrived by setting them RUNNABLE.
  */
 static void sys_sleep(uint64_t ticks_to_sleep) {
+    current->sleep_calls++;
     current->wake_tick = ticks + ticks_to_sleep;
     current->state = SLEEPING;
+    trace_emit(EV_SLEEP, current->pid);
     sched();
 }
 
@@ -142,8 +150,10 @@ static int64_t sys_wait(uint64_t status_uva) {
         if (!has_children)
             return -1;
 
-        /* Block until a child exits and wakes us. */
+        /* Block until a child exits and wakes us. sys_exit of a child
+         * will mark us RUNNABLE and emit the paired EV_WAKE. */
         current->state = SLEEPING;
+        trace_emit(EV_SLEEP, current->pid);
         sched();
         /* Woken by sys_exit of a child — loop back to scan. */
     }
