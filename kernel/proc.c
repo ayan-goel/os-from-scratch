@@ -16,6 +16,7 @@
  */
 
 #include "proc.h"
+#include "sched.h"
 #include "fs.h"
 #include "trace.h"
 #include "mm/pmem.h"
@@ -98,6 +99,10 @@ proc_t *proc_alloc(void) {
                 vm_pa_of(kernel_pagetable, PHYS_BASE),
                 "proc_alloc: clone doesn't see kernel RAM");
 
+        /* Phase 4: let the active scheduler seed any per-proc state
+         * it needs (e.g. MLFQ level). RR's hook is a no-op. */
+        active_sched->on_proc_init(p);
+
         return p;
     }
     return NULL; /* no free slots */
@@ -146,6 +151,12 @@ void sched(void) {
     /* T5: count the scheduling decision globally so stats can report
      * overall throughput even after processes exit and free their slots. */
     sched_total_decisions++;
+
+    /* Phase 4: tell the active policy a burst just closed so it can
+     * react to the reason (p->state encodes it: RUNNABLE = preempted,
+     * SLEEPING = voluntary sleep, ZOMBIE = exit). RR's hook is a no-op;
+     * MLFQ uses this to demote on quantum-expiry preempt. */
+    active_sched->on_burst_end(p);
 
     current = NULL;
     switch_context(&p->context, &scheduler_context);
@@ -513,12 +524,14 @@ proc_t *proc_exec_static(const void *bin, uint64_t size,
  * scheduler — the main scheduling loop. Runs in the kmain stack context.
  * Never returns.
  *
- * This is a simple round-robin: scan the table in order, run each RUNNABLE
- * process for one scheduling quantum. The timer interrupt calls sched() to
- * preempt the running process and return here.
+ * Phase 4 split: policy-independent bookkeeping (zombie reap, RUNNING
+ * transition, burst_start_tick stamp, EV_RUN emit, context switch) lives
+ * here; "what runs next" is delegated to active_sched->pick_next().
  *
- * In T5, there is no quantum: the process runs until it calls sched() itself
- * (voluntary yield). Timer-driven preemption is wired in T8.
+ * Round-robin's pick_next walks proc_table once per sweep. When it
+ * returns NULL the sweep is done; we wfi until the next interrupt and
+ * start a fresh sweep on wake. MLFQ's pick_next will scan its priority
+ * queues without changing the surrounding logic.
  */
 void scheduler(void) {
     uart_puts("scheduler: starting\n");
@@ -537,19 +550,16 @@ void scheduler(void) {
          */
         CSR_SET(mstatus, MSTATUS_MIE);
 
-        int found = 0;
+        /* Reap parentless zombies once per sweep. Independent of policy. */
         for (int i = 0; i < NPROC; i++) {
             proc_t *p = &proc_table[i];
-
-            /* Reap parentless zombies. */
-            if (p->state == ZOMBIE && p->parent == NULL) {
+            if (p->state == ZOMBIE && p->parent == NULL)
                 proc_free(p);
-                continue;
-            }
+        }
 
-            if (p->state != RUNNABLE)
-                continue;
-
+        int found = 0;
+        proc_t *p;
+        while ((p = active_sched->pick_next()) != NULL) {
             found = 1;
             p->state = RUNNING;
             if (p->first_run_tick == 0)
@@ -563,17 +573,19 @@ void scheduler(void) {
              */
             if (p->init_fn == 0)
                 trace_emit(EV_RUN, p->pid);
-            current  = p;
+            current = p;
             CSR_CLEAR(mstatus, MSTATUS_MIE);
             switch_context(&scheduler_context, &p->context);
             /* Back from sched(). current is NULL. Re-enable MIE
-             * for the next iteration's scan + wfi. */
+             * for the next iteration's pick. */
             CSR_SET(mstatus, MSTATUS_MIE);
         }
 
-        if (!found) {
-            /* Idle — MIE already set above. wfi wakes on timer. */
+        /* If the entire sweep produced nothing RUNNABLE, idle until
+         * the next interrupt. Otherwise restart the sweep immediately
+         * — preserves the pre-Phase-4 behavior of not inserting a wfi
+         * between sweeps when work is available. */
+        if (!found)
             __asm__ volatile("wfi");
-        }
     }
 }

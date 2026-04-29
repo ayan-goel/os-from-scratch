@@ -35,7 +35,8 @@ TRACE_RE = re.compile(
     r"^TRACE\s+tick=0x([0-9a-fA-F]+)\s+pid=0x([0-9a-fA-F]+)\s+ev=(\w+)\s*$"
 )
 
-EVENT_NAMES = {"SPAWN", "EXIT", "RUN", "YIELD", "PREEMPT", "SLEEP", "WAKE"}
+EVENT_NAMES = {"SPAWN", "EXIT", "RUN", "YIELD", "PREEMPT", "SLEEP", "WAKE",
+               "DEMOTE", "BOOST"}
 
 
 def parse_log(path):
@@ -162,28 +163,29 @@ def workload_summary(records, intervals):
     Per-pid totals. run_ticks is summed interval width (proxy for CPU
     consumed); counts are simple event frequencies.
     """
+    blank = lambda: {"run_ticks": 0, "yields": 0, "preempts": 0,
+                     "sleeps": 0, "spawns": 0, "exits": 0, "wakes": 0,
+                     "demotes": 0}
     summary = {}
     for pid, ivs in intervals.items():
-        summary.setdefault(pid, {"run_ticks": 0, "yields": 0,
-                                 "preempts": 0, "sleeps": 0, "spawns": 0,
-                                 "exits": 0, "wakes": 0})
+        summary.setdefault(pid, blank())
         summary[pid]["run_ticks"] = sum(e - s for s, e in ivs)
 
     for _tick, pid, ev in records:
-        summary.setdefault(pid, {"run_ticks": 0, "yields": 0,
-                                 "preempts": 0, "sleeps": 0, "spawns": 0,
-                                 "exits": 0, "wakes": 0})
+        summary.setdefault(pid, blank())
         key = {"YIELD": "yields", "PREEMPT": "preempts", "SLEEP": "sleeps",
-               "SPAWN": "spawns", "EXIT": "exits", "WAKE": "wakes"}.get(ev)
+               "SPAWN": "spawns", "EXIT": "exits", "WAKE": "wakes",
+               "DEMOTE": "demotes"}.get(ev)
         if key:
             summary[pid][key] += 1
+    # BOOST is a global event (pid=0); not aggregated per-proc.
 
     return summary
 
 
 def write_summary_csv(summary, path):
     cols = ["pid", "run_ticks", "yields", "preempts", "sleeps",
-            "spawns", "exits", "wakes"]
+            "spawns", "exits", "wakes", "demotes"]
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(cols)

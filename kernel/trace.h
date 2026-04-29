@@ -24,6 +24,8 @@ typedef enum {
     EV_PREEMPT = 5,   /* timer-driven preemption of a user proc */
     EV_SLEEP   = 6,   /* sys_sleep / kernel_sleep */
     EV_WAKE    = 7,   /* timer handler wakes a sleeping proc */
+    EV_DEMOTE  = 8,   /* MLFQ: proc moved to a lower priority queue */
+    EV_BOOST   = 9,   /* MLFQ: periodic priority boost (pid=0 sentinel) */
 } trace_event_type_t;
 
 typedef struct {

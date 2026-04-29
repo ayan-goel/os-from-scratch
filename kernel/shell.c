@@ -18,7 +18,9 @@
 #include "io.h"
 #include "fs.h"
 #include "proc.h"
+#include "sched.h"
 #include "trace.h"
+#include "arch/riscv.h"
 #include "dev/clint.h"
 #include "dev/uart.h"
 #include "defs.h"
@@ -99,7 +101,7 @@ static void cmd_help(void) {
     out_puts("  run <name> [n]    spawn n copies of program name\n");
     out_puts("  kill <pid>        terminate process\n");
     out_puts("  stats             print scheduler statistics\n");
-    out_puts("  sched <name>      hot-swap scheduler (stub)\n");
+    out_puts("  sched [name]      show/swap scheduler (rr | round-robin | mlfq)\n");
     out_puts("  quantum [ms]      show/set timer quantum (stub)\n");
     out_puts("  trace [n|clear]   dump last n events (default 64), or clear ring\n");
     out_puts("  clear             clear the shell output panel\n");
@@ -202,9 +204,58 @@ static void cmd_stats(void) {
     }
 }
 
+/*
+ * cmd_sched — show or hot-swap the active scheduler.
+ *
+ * No arg: prints the currently-active policy name.
+ *
+ * With arg ∈ {"rr", "round-robin", "mlfq"}: looks up the policy via
+ * sched_policy_by_name, then atomically (relative to timer ISR) swaps
+ * `active_sched`. The swap procedure:
+ *
+ *   1. Disable MIE — prevents the timer ISR from firing mid-swap and
+ *      observing a half-installed policy. Single-CPU makes this all
+ *      we need; SMP would require a full memory barrier + each CPU
+ *      acknowledging the swap.
+ *   2. Write active_sched.
+ *   3. Call new_policy->on_activate() to seed per-proc state for
+ *      processes that were created under the old policy. RR's hook
+ *      resets the cursor; MLFQ's will reset every proc to level 0.
+ *   4. Re-enable MIE.
+ *
+ * The TUI header bar reads `active_sched->name` directly, so the
+ * change is visible within one frame (≤50 ms).
+ */
 static void cmd_sched(const char *arg) {
-    (void)arg;
-    out_puts("sched: hot-swap not implemented until Phase 4 (MLFQ)\n");
+    if (*arg == '\0') {
+        out_puts("sched: ");
+        out_puts(active_sched->name);
+        out_putc('\n');
+        return;
+    }
+
+    sched_policy_t *p = sched_policy_by_name(arg);
+    if (p == NULL) {
+        out_puts("sched: unknown policy '");
+        out_puts(arg);
+        out_puts("' (try: rr, round-robin, mlfq)\n");
+        return;
+    }
+
+    CSR_CLEAR(mstatus, MSTATUS_MIE);
+    active_sched = p;
+    p->on_activate();
+    CSR_SET(mstatus, MSTATUS_MIE);
+
+    out_puts("sched: switched to ");
+    out_puts(p->name);
+    out_putc('\n');
+    /* Echo direct-to-UART so a scripted experiment can grep for the
+     * confirmation regardless of TUI panel scrolling. Same trick as
+     * cmd_quantum's confirmation line. */
+    uart_puts("sched: switched to ");
+    uart_puts(p->name);
+    uart_putc('\n');
 }
 
 /*
@@ -243,6 +294,8 @@ static const char *ev_name(uint8_t type) {
     case EV_PREEMPT: return "PREEMPT";
     case EV_SLEEP:   return "SLEEP";
     case EV_WAKE:    return "WAKE";
+    case EV_DEMOTE:  return "DEMOTE";
+    case EV_BOOST:   return "BOOST";
     default:         return "?";
     }
 }

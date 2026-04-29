@@ -34,6 +34,7 @@ LDFLAGS := -T linker.ld -nostdlib
 KERNEL_C_SRCS   := kernel/main.c \
                    kernel/trap.c \
                    kernel/proc.c \
+                   kernel/sched.c \
                    kernel/syscall.c \
                    kernel/ring.c \
                    kernel/io.c \

@@ -9,6 +9,7 @@
 #include "syscall.h"
 #include "shell.h"
 #include "proc.h"
+#include "sched.h"
 #include "trace.h"
 #include "mm/vm.h"
 #include "dev/clint.h"
@@ -97,6 +98,12 @@ void trap_handler(trap_frame_t *frame) {
             }
         }
 
+        /* Phase 4: per-tick policy hook. RR's is a no-op; MLFQ uses
+         * this for the periodic priority boost (every BOOST_INTERVAL
+         * ticks, lift everyone back to the top queue to prevent
+         * starvation). */
+        active_sched->on_periodic();
+
         /* P2.1: drain the UART RX FIFO into the shell's input ring.
          * We're in M-mode with interrupts disabled and no one else is
          * racing us for the UART, so a simple loop is safe. */
@@ -107,8 +114,15 @@ void trap_handler(trap_frame_t *frame) {
 #ifdef TRAP_DEBUG_TICK
         uart_puts("tick\n");
 #endif
-        /* Preempt the current user process if one is running. */
-        if (is_user && current != NULL && current->state == RUNNING) {
+        /*
+         * Preempt the current user process if the active policy says
+         * so. RR's should_preempt always returns 1 (preempt every tick
+         * = the Phase 3 baseline). MLFQ's tracks per-level allotments
+         * and only returns 1 when the current level's quantum is
+         * exhausted; the call itself charges one tick to the allotment.
+         */
+        if (is_user && current != NULL && current->state == RUNNING &&
+            active_sched->should_preempt(current)) {
             current->involuntary_preempts++;
             current->state = RUNNABLE;
             trace_emit(EV_PREEMPT, current->pid);

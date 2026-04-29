@@ -82,6 +82,12 @@ typedef struct proc {
     uint32_t involuntary_preempts;/* timer-driven preemptions */
     uint32_t sleep_calls;         /* sys_sleep / kernel_sleep calls */
 
+    /* Phase 4 (T3): MLFQ per-proc state. Initialized in proc_alloc via
+     * active_sched->on_proc_init. Untouched while RR is active. */
+    uint8_t  mlfq_level;          /* 0 = highest priority, MLFQ_LEVELS-1 = lowest */
+    uint16_t mlfq_used_in_level;  /* ticks consumed at current level */
+    uint64_t mlfq_demote_count;   /* lifetime demotions (for stats + trace) */
+
     /*
      * Scheduler-specific accounting fields are added as each scheduler phase
      * needs them. See SPEC.md §4 Phase 3/5 for the staging plan.

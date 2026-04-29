@@ -27,6 +27,7 @@
 #include "shell.h"
 #include "ring.h"
 #include "proc.h"
+#include "sched.h"
 #include "dev/uart.h"
 #include "dev/clint.h"
 #include "defs.h"
@@ -160,11 +161,14 @@ static void tui_draw_static_frame(void) {
 static void tui_draw_header(void) {
     ansi_goto(1, 1);
 
-    /* " os-from-scratch  sched:round-robin  uptime:MM:SS" */
+    /* " os-from-scratch  sched:<name>  uptime:MM:SS" — the policy
+     * name comes from active_sched live, so `sched mlfq` flips the
+     * header on the next frame. */
     tui_write(" os-from-scratch");
     write_str_field("", 2);  /* spacer */
 
-    tui_write("sched:round-robin");
+    tui_write("sched:");
+    tui_write(active_sched->name);
     write_str_field("", 2);
 
     tui_write("uptime:");
@@ -265,8 +269,13 @@ static void tui_draw_sched(void) {
     clear_to(40 - 10);
 
     ansi_goto(4, 41);
-    tui_write("   algorithm : round-robin");
-    clear_to(40 - 26);
+    tui_write("   algorithm : ");
+    const char *name = active_sched->name;
+    int name_chars = 0;
+    while (name[name_chars]) name_chars++;
+    uart_write_raw(name, (uint64_t)name_chars);
+    /* Clear to width 40. Used so far: 15 (label) + name_chars. */
+    clear_to(40 - 15 - name_chars);
 
     ansi_goto(5, 41);
     tui_write("   quantum   : ");
