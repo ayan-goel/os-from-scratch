@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# run_experiments.sh — Phase 3/4 scheduler run matrix.
+# run_experiments.sh — Phase 3/4/5 scheduler run matrix.
 #
-# Phase 3 (round-robin only): 3 quanta × 5 workloads = 15 runs.
-# Phase 4 (RR + MLFQ):        2 sched × 3 quanta × 5 workloads = 30 runs.
+# Phase 3 (round-robin only):   3 quanta × 5 workloads          = 15 runs.
+# Phase 4 (RR + MLFQ):           2 sched × 3 quanta × 5 workloads = 30 runs.
+# Phase 5 (RR + MLFQ + V1/V2/V3): 5 sched × 6 workloads at q=10  = 30 runs.
+#                                  workloads include "concurrent" =
+#                                  cpu_bound + io_bound running together.
 #
 # For every (sched, quantum, workload), boot the kernel, wait for
 # init's boot-time children to finish, set the quantum, switch to
@@ -12,15 +15,10 @@
 #
 # Output layout:
 #   results/phase3/q${Q}_${W}.{raw,log,csv,gantt.png,summary.csv}
-#       — produced when invoked as `bash tools/run_experiments.sh`
-#         (no PHASE override) — preserves the Phase 3 baseline files
-#         exactly as they were before MLFQ existed.
 #   results/phase4/${SCHED}_q${Q}_${W}.{...}
-#       — produced when invoked as `PHASE=4 bash tools/run_experiments.sh`
-#         (or by the same script with the `phase4` arg).
+#   results/phase5/${SCHED}_${W}.{...}    (single quantum)
 #
-# The two layouts are kept side-by-side because the Phase 3 notes
-# reference results/phase3/ stems and shouldn't break.
+# Phase 3/4 outputs are kept untouched so prior notes still resolve.
 #
 # Requires: qemu-system-riscv64, perl (for the alarm wrapper used in
 # place of `timeout` on macOS), python3 + matplotlib for the parser.
@@ -33,9 +31,10 @@ PARSER="${ROOT}/tools/parse_trace.py"
 
 PHASE="${PHASE:-${1:-3}}"
 case "${PHASE}" in
-    3)  OUT="${ROOT}/results/phase3"; SCHEDS=(rr) ;;
-    4)  OUT="${ROOT}/results/phase4"; SCHEDS=(rr mlfq) ;;
-    *)  echo "run_experiments: unknown phase '${PHASE}' (try 3 or 4)" >&2; exit 1 ;;
+    3)  OUT="${ROOT}/results/phase3"; SCHEDS=(rr)                    ; QUANTA=(1 10 100); WORKLOADS=(cpu_bound io_bound mixed bursty forker) ;;
+    4)  OUT="${ROOT}/results/phase4"; SCHEDS=(rr mlfq)               ; QUANTA=(1 10 100); WORKLOADS=(cpu_bound io_bound mixed bursty forker) ;;
+    5)  OUT="${ROOT}/results/phase5"; SCHEDS=(rr mlfq v1 v2 bandit)  ; QUANTA=(10)      ; WORKLOADS=(cpu_bound io_bound mixed bursty forker concurrent) ;;
+    *)  echo "run_experiments: unknown phase '${PHASE}' (try 3, 4, or 5)" >&2; exit 1 ;;
 esac
 
 mkdir -p "${OUT}"
@@ -51,25 +50,30 @@ RUN_TIME=6         # workload runtime budget after `run` is issued
 TAIL_WAIT=2        # let final trace events flush before exit
 TOTAL=$(( BOOT_WAIT + RUN_TIME + TAIL_WAIT + 4 ))   # +4 buffer
 
-QUANTA=(1 10 100)
-WORKLOADS=(cpu_bound io_bound mixed bursty forker)
-
 run_one() {
     local s="$1" q="$2" w="$3"
     local stem
-    if [[ "${PHASE}" == "3" ]]; then
-        stem="q${q}_${w}"
-    else
-        stem="${s}_q${q}_${w}"
-    fi
+    case "${PHASE}" in
+        3)  stem="q${q}_${w}"            ;;
+        4)  stem="${s}_q${q}_${w}"       ;;
+        5)  stem="${s}_${w}"             ;;   # single quantum
+    esac
     local raw="${OUT}/${stem}.raw"
     local log="${OUT}/${stem}.log"
 
     echo "── sched=${s}  q=${q}ms  workload=${w}"
 
+    # Build the run-spawn block. "concurrent" = cpu_bound + io_bound.
+    local spawn_block
+    if [[ "${w}" == "concurrent" ]]; then
+        spawn_block=$'printf \'run cpu_bound\\n\'\nsleep 1\nprintf \'run io_bound\\n\''
+    else
+        spawn_block="printf 'run ${w}\\n'"
+    fi
+
     # Compose the input script:
     #   wait BOOT_WAIT for init to settle,
-    #   set quantum (RR uses it; MLFQ ignores per design),
+    #   set quantum (RR uses it; MLFQ/V1/V2/V3 ignore per design),
     #   switch to the requested scheduler,
     #   clear trace, spawn workload, wait, dump, idle.
     # QEMU exit protocol: after the trace dump, send Ctrl-A X
@@ -85,7 +89,7 @@ run_one() {
         sleep 1
         printf 'trace clear\n'
         sleep 1
-        printf 'run %s\n' "${w}"
+        eval "${spawn_block}"
         sleep "${RUN_TIME}"
         printf 'trace 1024\n'
         sleep "${TAIL_WAIT}"

@@ -190,11 +190,78 @@ static void tui_draw_header(void) {
     clear_to(80 - 51);
 }
 
+/*
+ * Burst-estimate bar (Phase 5 T3): under V1/V2/V3 the rightmost
+ * column of each proc row visualizes burst_estimate as 0..8 filled
+ * '#' chars (1 char per tick, saturating). Under RR/MLFQ the column
+ * is blank — same layout, no flicker, no policy-specific row width.
+ */
+static int policy_shows_burst_bar(void) {
+    return active_sched == &sched_v1
+        || active_sched == &sched_v2
+        || active_sched == &sched_bandit;
+}
+
+/*
+ * CLASS column (Phase 5 T4): under V2/V3 each proc row shows a 3-char
+ * label for proc_class (INT/IO /CPU/BAT). V1 has no class concept,
+ * RR/MLFQ leave it blank. Kernel threads are pinned to BAT at pick
+ * time; mirroring that here keeps the panel and the picker in sync.
+ */
+static int policy_shows_class(void) {
+    return active_sched == &sched_v2 || active_sched == &sched_bandit;
+}
+
+static const char *class_tag(proc_t *p) {
+    if (p->init_fn != 0)
+        return "BAT";
+    switch (p->proc_class) {
+    case PCLASS_INTERACTIVE: return "INT";
+    case PCLASS_IO_BOUND:    return "IO ";
+    case PCLASS_CPU_BOUND:   return "CPU";
+    case PCLASS_BATCH:       return "BAT";
+    default:                 return "???";
+    }
+}
+
+static void draw_burst_bar(uint32_t estimate) {
+    /* burst_estimate is stored at 8× scale (see proc.h V1 comment).
+     * Map (estimate >> 3) ticks → 0..8 filled chars, saturating. */
+    int filled = (int)(estimate >> 3);
+    if (filled > 8) filled = 8;
+    if (filled < 0) filled = 0;
+    char buf[8];
+    for (int i = 0; i < 8; i++)
+        buf[i] = (i < filled) ? '#' : ' ';
+    uart_write_raw(buf, 8);
+}
+
 static void tui_draw_procs(void) {
-    /* Rows 3-12, cols 1-39. Row 3 is the header row. */
+    /*
+     * Layout (39 cols total):
+     *   1  pad
+     *   4  pid
+     *   2  pad
+     *  10  name (was 14; shrunk to fit CLASS column)
+     *   1  pad
+     *   3  state
+     *   1  pad
+     *   3  CLASS  ("INT"/"IO "/"CPU"/"BAT" under V2/V3; "   " otherwise)
+     *   1  pad
+     *   8  burst bar (under V1/V2/V3; "        " otherwise)
+     *   5  pad
+     */
+    int show_bar   = policy_shows_burst_bar();
+    int show_class = policy_shows_class();
+
     ansi_goto(3, 1);
-    tui_write("  PID  NAME            ST ");
-    clear_to(39 - 26);  /* pad to col 39 */
+    /* Header. */
+    uart_write_raw("  PID  NAME       ST ", 21);
+    if (show_class) uart_write_raw("CLS ", 4); else uart_write_raw("    ", 4);
+    if (show_bar)   uart_write_raw("TAU      ", 9);
+    else            uart_write_raw("         ", 9);
+    /* 21+4+9 = 34. Pad to 39. */
+    clear_to(5);
 
     int row = 4;
     for (int i = 0; i < NPROC && row <= 12; i++) {
@@ -204,23 +271,35 @@ static void tui_draw_procs(void) {
 
         ansi_goto(row, 1);
 
-        /* " " + 4-wide pid + "  " + 14-wide name + "  " + 3-wide state + pad to 39 */
         uart_write_raw(" ", 1);
         write_int_field((uint64_t)p->pid, 4);
         uart_write_raw("  ", 2);
 
-        /* name (max 14 chars) */
-        char nbuf[15];
+        /* name (max 10 chars) */
+        char nbuf[11];
         int nl = 0;
-        while (nl < 14 && p->name[nl]) { nbuf[nl] = p->name[nl]; nl++; }
+        while (nl < 10 && p->name[nl]) { nbuf[nl] = p->name[nl]; nl++; }
         nbuf[nl] = '\0';
-        write_str_field(nbuf, 14);
-        uart_write_raw("  ", 2);
+        write_str_field(nbuf, 10);
+        uart_write_raw(" ", 1);
 
         write_str_field(state_tag(p->state), 3);
+        uart_write_raw(" ", 1);
 
-        /* Pad to col 39. 1+4+2+14+2+3 = 26. 39-26 = 13. */
-        clear_to(13);
+        if (show_class) {
+            uart_write_raw(class_tag(p), 3);
+        } else {
+            uart_write_raw("   ", 3);
+        }
+        uart_write_raw(" ", 1);
+
+        if (show_bar)
+            draw_burst_bar(p->burst_estimate);
+        else
+            uart_write_raw("        ", 8);
+
+        /* 1+4+2+10+1+3+1+3+1+8 = 34. Pad to 39 = 5. */
+        clear_to(5);
         row++;
     }
 
@@ -311,8 +390,33 @@ static void tui_draw_sched(void) {
     write_int_field(cps, 10);
     clear_to(40 - 25);
 
-    /* Blank rows 10-12. */
-    for (int r = 10; r <= 12; r++) {
+    /* Row 10: V3 WEIGHTS row (Phase 5 T5) — top-weighted feature
+     * index, label, and current value. Visible only under sched_bandit;
+     * blank otherwise. Format:  "   weights : f5 class     -1234" */
+    ansi_goto(10, 41);
+    if (active_sched == &sched_bandit) {
+        int top = v3_top_feature();
+        int32_t w = v3_weight(top);
+        tui_write("   weights : f");
+        write_int_field((uint64_t)top, 1);
+        uart_write_raw(" ", 1);
+        uart_write_raw(v3_feature_name(top), 9);
+        uart_write_raw(" ", 1);
+        if (w < 0) {
+            uart_write_raw("-", 1);
+            write_int_field((uint64_t)(-w), 7);
+        } else {
+            uart_write_raw(" ", 1);
+            write_int_field((uint64_t)w, 7);
+        }
+        /* 14 + 1 + 1 + 9 + 1 + 1 + 7 = 34. Pad to 40 = 6. */
+        clear_to(6);
+    } else {
+        clear_to(40);
+    }
+
+    /* Blank rows 11-12. */
+    for (int r = 11; r <= 12; r++) {
         ansi_goto(r, 41);
         clear_to(40);
     }

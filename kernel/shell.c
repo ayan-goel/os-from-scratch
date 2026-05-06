@@ -101,7 +101,7 @@ static void cmd_help(void) {
     out_puts("  run <name> [n]    spawn n copies of program name\n");
     out_puts("  kill <pid>        terminate process\n");
     out_puts("  stats             print scheduler statistics\n");
-    out_puts("  sched [name]      show/swap scheduler (rr | round-robin | mlfq)\n");
+    out_puts("  sched [name]      show/swap scheduler (rr | mlfq | v1 | v2 | bandit)\n");
     out_puts("  quantum [ms]      show/set timer quantum (stub)\n");
     out_puts("  trace [n|clear]   dump last n events (default 64), or clear ring\n");
     out_puts("  clear             clear the shell output panel\n");
@@ -238,7 +238,7 @@ static void cmd_sched(const char *arg) {
     if (p == NULL) {
         out_puts("sched: unknown policy '");
         out_puts(arg);
-        out_puts("' (try: rr, round-robin, mlfq)\n");
+        out_puts("' (try: rr, round-robin, mlfq, v1, v2, bandit)\n");
         return;
     }
 
@@ -333,6 +333,12 @@ static void cmd_trace(const char *arg) {
 
     uint64_t end = start + count;            /* exclusive */
     uint64_t first = (count > want) ? (end - want) : start;
+
+    /* Leading newline so the first TRACE record starts on a fresh line.
+     * Without it, the TUI's last-frame cursor-position bytes (no \n at
+     * end) prefix the first record after ANSI stripping, breaking the
+     * `^TRACE` anchor in tools/parse_trace.py. */
+    uart_putc('\n');
 
     for (uint64_t idx = first; idx < end; idx++) {
         trace_event_t e;

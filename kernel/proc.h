@@ -82,11 +82,41 @@ typedef struct proc {
     uint32_t involuntary_preempts;/* timer-driven preemptions */
     uint32_t sleep_calls;         /* sys_sleep / kernel_sleep calls */
 
-    /* Phase 4 (T3): MLFQ per-proc state. Initialized in proc_alloc via
-     * active_sched->on_proc_init. Untouched while RR is active. */
-    uint8_t  mlfq_level;          /* 0 = highest priority, MLFQ_LEVELS-1 = lowest */
-    uint16_t mlfq_used_in_level;  /* ticks consumed at current level */
-    uint64_t mlfq_demote_count;   /* lifetime demotions (for stats + trace) */
+    /* Phase 4/5: per-policy allotment state.
+     *
+     * mlfq_level / mlfq_demote_count are MLFQ-only. mlfq_used_in_level
+     * is reused by V2 as its class-quantum counter (V2's class →
+     * quantum mapping needs a per-proc counter and MLFQ is inactive
+     * when V2 is, so dual-use is safe). Both policies reset it to 0
+     * at activate/burst-end so a hot-swap doesn't leak stale values. */
+    uint8_t  mlfq_level;          /* MLFQ: 0 = highest, MLFQ_LEVELS-1 = lowest */
+    uint16_t mlfq_used_in_level;  /* MLFQ: ticks at current level; V2: ticks at current class */
+    uint64_t mlfq_demote_count;   /* MLFQ: lifetime demotions (for stats + trace) */
+
+    /* Phase 5 V1: exponentially-weighted burst-length estimate.
+     * τ_{n+1} = ((t_n << 3) + τ_n) >> 1  with α=1/2 — one shift + one
+     * add per burst completion. Stored at 8× scale (3 fractional bits)
+     * to keep ≥1 bit of precision after the right-shift; without this,
+     * 1-tick bursts collapse to τ=0 forever (tick-resolution floor).
+     * Convert back to ticks via (burst_estimate >> 3).
+     *
+     * v1_pick_next picks the RUNNABLE proc with the smallest τ
+     * (approximate SRTF). V2/V3 use this same field as a feature.
+     * Untouched under RR/MLFQ. */
+    uint32_t burst_estimate;
+
+    /* Phase 5 V2: online classification into one of 4 behavioral classes.
+     * burst_variance is a β=1/4 EW estimate of (last_burst - τ)² —
+     * tracked but unused by the classifier (kept for V3's context vec).
+     * proc_class is updated on every burst end via a hand-coded threshold
+     * tree; v2_pick_next prioritizes classes 0..3 in order. */
+    uint32_t burst_variance;
+    uint8_t  proc_class;
+
+    /* Phase 5 V3: contextual bandit visit count. Used in the UCB
+     * exploration bonus (rare-procs get a higher score so the bandit
+     * doesn't permanently lock out untried options). */
+    uint32_t v3_visits;
 
     /*
      * Scheduler-specific accounting fields are added as each scheduler phase

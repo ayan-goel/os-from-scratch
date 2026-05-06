@@ -54,6 +54,27 @@ extern sched_policy_t * volatile active_sched;
  * (added in T3). Phase 5 will add v1 / v2 / bandit. */
 extern sched_policy_t sched_rr;
 extern sched_policy_t sched_mlfq;
+extern sched_policy_t sched_v1;
+extern sched_policy_t sched_v2;
+extern sched_policy_t sched_bandit;
+
+/*
+ * V2 process classes. Lower number = higher scheduling priority.
+ * Classes are derived from per-process behavior on each burst end:
+ *   INTERACTIVE: high voluntary-yield ratio, short bursts — UI-like
+ *   IO_BOUND:    sleeps frequently, short bursts — disk/network-like
+ *   CPU_BOUND:   gets preempted regularly, no sleeps — pure compute
+ *   BATCH:       fallback — runs only when nothing higher RUNNABLE
+ * Kernel threads are pinned to BATCH at pick time (same trick as
+ * MLFQ's init_fn != 0 special case).
+ */
+typedef enum {
+    PCLASS_INTERACTIVE = 0,
+    PCLASS_IO_BOUND    = 1,
+    PCLASS_CPU_BOUND   = 2,
+    PCLASS_BATCH       = 3,
+    PCLASS_COUNT       = 4,
+} proc_class_t;
 
 /*
  * MLFQ tunables — exposed in the header so notes/tools can reason
@@ -76,5 +97,17 @@ extern const uint16_t mlfq_allotment[MLFQ_LEVELS];
  * "mlfq" for MLFQ. Returns NULL if no match. cmd_sched uses this.
  */
 sched_policy_t *sched_policy_by_name(const char *name);
+
+/*
+ * V3 introspection accessors — read-only, used by the TUI to render
+ * the WEIGHTS row when sched_bandit is active.
+ *
+ *   v3_top_feature()    index in [0..7] of the largest |w_i|
+ *   v3_weight(i)        signed weight value for feature i
+ *   v3_feature_name(i)  short label for feature i
+ */
+int         v3_top_feature(void);
+int32_t     v3_weight(int idx);
+const char *v3_feature_name(int idx);
 
 #endif /* SCHED_H */
