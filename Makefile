@@ -72,7 +72,7 @@ all: $(TARGET)
 # CFLAGS are inherited from the kernel (freestanding, no libc) but the
 # -Ikernel flag is harmless since user sources only #include "ulib.h" which
 # lives in user/ (found via the default "." include path used by gcc).
-USER_PROGS  := init hello cpu_bound io_bound spin mixed bursty forker
+USER_PROGS  := init hello cpu_bound io_bound spin mixed bursty forker flipper wolf
 USER_ULIB_O := user/ulib.o
 
 # Per-program objects (each has its own _start).

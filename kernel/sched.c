@@ -309,71 +309,116 @@ sched_policy_t sched_v1 = {
 
 /* ── V2: Online Process Classifier + Policy Map ──────────────────── */
 /*
- * V2 augments V1's burst estimate with two more features computed
- * online:
+ * V2 augments V1's burst estimate with online behavioral counts:
  *
  *   - burst_variance: β=1/4 EW estimate of (last_burst - burst_estimate)²
- *     (kept for V3's context vector; the classifier itself only uses
- *     burst_estimate, voluntary_yields, sleep_calls, involuntary_preempts)
+ *     (kept for V3's context vector; the classifier itself ignores it)
  *
- *   - voluntary_yield_ratio: fixed-point in 1/256 units, computed at
- *     classify time. yields / (yields + preempts + 1)
+ *   - burst_window (Phase 7): ring of the K=10 most recent burst-end
+ *     reasons (SLEEP / YIELD / PREEMPT / EXIT / OTHER). The classifier
+ *     scans the most-recent K'=5 entries to determine the dominant
+ *     recent behavior. Replaces the lifetime sleep_calls /
+ *     voluntary_yields / involuntary_preempts inputs the Phase 5
+ *     classifier used.
  *
- * The classifier is a hand-coded threshold tree — structurally a Naive
- * Bayes model with equal priors and hard thresholds, the simplest
- * thing that discriminates the four classes Phase 6's workloads
- * exhibit. The tree is intentionally conservative (the four conditions
- * are independent so misclassification is bounded) and has no tuning
- * knobs — every threshold has a 1-line justification.
+ * The Phase 5 classifier had a stickiness bug: after flipper's Phase A
+ * (10 sleeps) the lifetime sleep_calls counter was permanently above
+ * any threshold, locking V2 at IO_BOUND even after the workload
+ * switched to cpu-bound behavior. Phase 6 §"Honest losses" documents
+ * the failure; Phase 7 fixes it by switching to windowed inputs.
  *
- * Pick rule: scan classes 0..3 in priority order; within each class,
- * advance a single shared cursor for round-robin fairness. This is
- * structurally identical to MLFQ's pick_next but the level mapping is
- * data-driven (per-proc class) instead of demotion-driven (per-proc
- * level).
+ * Pick rule and class quantum (should_preempt) are unchanged.
  */
 
+/* Burst-end-reason encoding used by the window ring. */
+#define V2_WIN_SLEEP    0
+#define V2_WIN_YIELD    1
+#define V2_WIN_PREEMPT  2
+#define V2_WIN_EXIT     3
+#define V2_WIN_OTHER    4
+
+/* Recent-window size used by the classifier. The ring (`burst_window`)
+ * holds K=10 entries; the classifier looks at the most-recent K'=5,
+ * which gives V2 ~3 cpu preempts of phase-change adaptation budget on
+ * flipper — close to MLFQ's demote-ladder pace. */
+#define V2_WIN_RECENT   5
+
+/* Count occurrences of `reason` in the most-recent V2_WIN_RECENT
+ * entries of p->burst_window. Walks backward from the cursor through
+ * up to V2_WIN_RECENT slots, stopping early if the ring isn't full
+ * (a freshly spawned proc has fewer recorded bursts than V2_WIN_RECENT).
+ *
+ * O(V2_WIN_RECENT) per call — single tight loop, no allocation.
+ */
+static uint8_t v2_window_count(struct proc *p, uint8_t reason) {
+    uint8_t hits = 0;
+    uint8_t scan = p->burst_window_fill < V2_WIN_RECENT
+                 ? p->burst_window_fill
+                 : V2_WIN_RECENT;
+    int idx = (int)p->burst_window_cursor - 1;
+    for (uint8_t i = 0; i < scan; i++) {
+        if (idx < 0)
+            idx += (int)(sizeof(p->burst_window));
+        if (p->burst_window[idx] == reason)
+            hits++;
+        idx--;
+    }
+    return hits;
+}
+
 static proc_class_t v2_classify(struct proc *p) {
-    /* Voluntary-yield ratio in 1/256 fixed-point. The +1 in the
-     * denominator avoids a divide-by-zero on freshly-spawned procs
-     * and biases toward "interactive" until the first burst. */
-    uint32_t denom = p->voluntary_yields + p->involuntary_preempts + 1;
-    uint32_t yield_ratio = (p->voluntary_yields * 256) / denom;
+    /* Phase 7: classify from the dominant behavior in the recent
+     * window, not from lifetime totals. This makes the classifier
+     * responsive to phase changes — after a few cpu-bound bursts the
+     * old sleep-heavy history rolls out of the K' window and
+     * CPU_BOUND wins. */
+    uint8_t sl = v2_window_count(p, V2_WIN_SLEEP);
+    uint8_t yi = v2_window_count(p, V2_WIN_YIELD);
+    uint8_t pr = v2_window_count(p, V2_WIN_PREEMPT);
 
     /*
-     * INTERACTIVE: yields way more than it gets preempted (yield_ratio
-     * > 50%) AND has short bursts. The shell/tui kernel threads would
-     * match this — but the pick_next override pins kernel threads to
-     * BATCH regardless of class. burst_estimate is stored at 8× scale
-     * (see proc.h), so "≤ 1 tick" is "≤ 8" in stored units.
+     * INTERACTIVE: voluntary yields dominate the recent window. Short
+     * bursts (≤ 1 tick stored as ≤ 8 at 8× scale) is still required so
+     * a sleeping-and-yielding workload doesn't get the highest priority
+     * if its bursts are actually long. Threshold: yields > both sleeps
+     * AND preempts in the same window — a strict "majority interactive".
      */
-    if (yield_ratio > 128 && p->burst_estimate <= 8)
+    if (yi > sl && yi > pr && p->burst_estimate <= 8)
         return PCLASS_INTERACTIVE;
 
     /*
-     * IO_BOUND: has slept at least twice and recent bursts are short.
-     * The "twice" threshold filters one-off sleeps from genuinely
-     * sleep-driven workloads.
+     * IO_BOUND: sleeps dominate preempts in the recent window. No
+     * burst_estimate gate (that was the second half of the Phase 5
+     * stickiness bug — bursts of length 1 keep burst_estimate at 8
+     * forever, blocking IO_BOUND→CPU_BOUND transitions).
      */
-    if (p->sleep_calls >= 2 && p->burst_estimate <= 8)
+    if (sl > pr)
         return PCLASS_IO_BOUND;
 
     /*
-     * CPU_BOUND: at least one preempt (so the scheduler has actually
-     * observed it running) AND fewer sleeps than preempts (otherwise
-     * it would have been classified as I/O above).
+     * CPU_BOUND: at least one preempt observed in the window AND
+     * preempts ≥ sleeps. Equality goes to CPU_BOUND so that workloads
+     * mixing sleep and preempt 50/50 get the longer quantum (cheaper).
      */
-    if (p->involuntary_preempts > 0 &&
-        p->sleep_calls < p->involuntary_preempts)
+    if (pr > 0 && pr >= sl)
         return PCLASS_CPU_BOUND;
 
-    /* Fallback. New procs without enough history land here. */
+    /* Fallback. Empty window (fresh procs before their first burst end)
+     * or all-OTHER entries land here. */
     return PCLASS_BATCH;
 }
 
 static void v2_on_burst_end(struct proc *p) {
-    if (p->state == ZOMBIE)
+    if (p->state == ZOMBIE) {
+        /* Record the exit so an immediate re-classify of any sibling
+         * scanning this slot sees a stable end reason, then bail. */
+        p->burst_window[p->burst_window_cursor] = V2_WIN_EXIT;
+        p->burst_window_cursor = (p->burst_window_cursor + 1)
+                                 % sizeof(p->burst_window);
+        if (p->burst_window_fill < sizeof(p->burst_window))
+            p->burst_window_fill++;
         return;
+    }
 
     /* Update burst_variance: standard EW variance with β=1/4.
      *   σ²_new = (1/4)·diff² + (3/4)·σ²_old
@@ -386,13 +431,38 @@ static void v2_on_burst_end(struct proc *p) {
     /* Update burst_estimate: same 8×-scale EWMA as V1. */
     p->burst_estimate = (((uint32_t)p->last_burst << 3) + p->burst_estimate + 1) >> 1;
 
-    /* Reclassify. Cheap — at most 2 comparisons per condition. */
+    /* Phase 7: record this burst's end reason in the window ring.
+     * State alone can't distinguish YIELD from PREEMPT (both leave
+     * p->state == RUNNABLE), so we diff the lifetime counters against
+     * the v2_last_* snapshots taken at the previous burst-end. */
+    uint8_t reason;
+    if (p->state == SLEEPING) {
+        reason = V2_WIN_SLEEP;
+    } else if (p->state == RUNNABLE) {
+        if (p->voluntary_yields > p->v2_last_yields) {
+            reason = V2_WIN_YIELD;
+        } else if (p->involuntary_preempts > p->v2_last_preempts) {
+            reason = V2_WIN_PREEMPT;
+        } else {
+            reason = V2_WIN_OTHER;
+        }
+    } else {
+        reason = V2_WIN_OTHER;
+    }
+    p->v2_last_yields   = p->voluntary_yields;
+    p->v2_last_preempts = p->involuntary_preempts;
+
+    p->burst_window[p->burst_window_cursor] = reason;
+    p->burst_window_cursor = (p->burst_window_cursor + 1)
+                             % sizeof(p->burst_window);
+    if (p->burst_window_fill < sizeof(p->burst_window))
+        p->burst_window_fill++;
+
+    /* Reclassify from the updated window. */
     p->proc_class = (uint8_t)v2_classify(p);
 
     /* Reset the class-quantum counter so the next burst at this class
-     * gets a fresh slice. This is the "allotment per burst" semantics
-     * (vs MLFQ's "allotment per level") — procs that voluntarily yield
-     * mid-allotment don't lose the rest of their slice on next run. */
+     * gets a fresh slice. */
     p->mlfq_used_in_level = 0;
 }
 
@@ -457,16 +527,32 @@ static void v2_on_proc_init(struct proc *p) {
     /* Optimistic default — new procs are treated as INTERACTIVE until
      * their first burst contradicts that. */
     p->proc_class = PCLASS_INTERACTIVE;
+    /* Phase 7: ring starts empty; snapshots start at current lifetime
+     * values (zero on a fresh slot, but proc_alloc may rerun for a
+     * recycled slot). */
+    for (uint64_t i = 0; i < sizeof(p->burst_window); i++)
+        p->burst_window[i] = V2_WIN_OTHER;
+    p->burst_window_cursor = 0;
+    p->burst_window_fill   = 0;
+    p->v2_last_yields      = p->voluntary_yields;
+    p->v2_last_preempts    = p->involuntary_preempts;
 }
 static void v2_on_activate(void) {
     /* Reclassify everyone the first time we see them so a hot-swap
      * from another policy doesn't run with stale class assignments.
      * Also zero mlfq_used_in_level so the dual-use counter starts
-     * fresh — a swap from MLFQ may have left it mid-allotment. */
+     * fresh — a swap from MLFQ may have left it mid-allotment.
+     *
+     * Phase 7: also resync the V2-private yield/preempt snapshots to
+     * the current lifetime values so the next burst-end's diff
+     * reflects only ticks during this V2 activation, not ticks that
+     * happened under whichever policy ran in the meantime. */
     for (int i = 0; i < NPROC; i++) {
         if (proc_table[i].state != UNUSED) {
             proc_table[i].proc_class = (uint8_t)v2_classify(&proc_table[i]);
             proc_table[i].mlfq_used_in_level = 0;
+            proc_table[i].v2_last_yields   = proc_table[i].voluntary_yields;
+            proc_table[i].v2_last_preempts = proc_table[i].involuntary_preempts;
         }
     }
 }
@@ -765,6 +851,35 @@ sched_policy_t sched_bandit = {
 /* ── Active-policy globals + name lookup ─────────────────────────── */
 
 sched_policy_t * volatile active_sched = &sched_rr;
+
+/* ── Phase 6: per-policy decision overhead accumulators ──────────────
+ * Indexed by sched_policy_index(): 0=rr, 1=mlfq, 2=v1, 3=v2, 4=bandit.
+ * Updated from scheduler() in proc.c — instrumentation lives OUTSIDE
+ * the policy bodies per SPEC.md §Phase 6 (no policy diff vs Phase 5).
+ * Read-only sampling: scheduler() reads rdcycle before and after
+ * active_sched->pick_next() and adds the delta here. */
+uint64_t sched_decisions_total[SCHED_POLICY_COUNT];
+uint64_t sched_cycles_total[SCHED_POLICY_COUNT];
+
+int sched_policy_index(const sched_policy_t *pol) {
+    if (pol == &sched_rr)     return 0;
+    if (pol == &sched_mlfq)   return 1;
+    if (pol == &sched_v1)     return 2;
+    if (pol == &sched_v2)     return 3;
+    if (pol == &sched_bandit) return 4;
+    return -1;
+}
+
+const char *sched_policy_name_by_index(int idx) {
+    switch (idx) {
+    case 0: return "rr";
+    case 1: return "mlfq";
+    case 2: return "v1";
+    case 3: return "v2";
+    case 4: return "bandit";
+    default: return "?";
+    }
+}
 
 static int sched_streq(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }

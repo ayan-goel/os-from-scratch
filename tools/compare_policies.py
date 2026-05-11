@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-compare_policies.py — Phase 5 cross-policy comparison.
+compare_policies.py — cross-policy comparison for Phase 5 + Phase 6.
 
-Reads results/phase5/${SCHED}_${WORKLOAD}.{log,summary.csv} for every
-combination produced by `bash tools/run_experiments.sh 5` and prints a
-side-by-side comparison table per workload.
+Reads results/phase${PHASE}/${SCHED}_${WORKLOAD}.{log} for every
+combination produced by `bash tools/run_experiments.sh ${PHASE}` and
+prints a side-by-side comparison table per workload.
+
+Usage:
+  python3 tools/compare_policies.py            # phase 5 (default, back-compat)
+  python3 tools/compare_policies.py --phase 6  # phase 6 incl. flipper, wolf,
+                                               # and per-policy cyc/dec column
 
 For each (workload, scheduler) cell, reports:
   events     — total trace records (proxy for scheduler overhead)
@@ -12,38 +17,53 @@ For each (workload, scheduler) cell, reports:
   sleeps     — workload's voluntary sleeps
   demotes    — MLFQ-only; non-zero indicates the demote ladder fired
   run_ticks  — sum of RUN-interval widths for the workload's primary pid
+  cyc/dec    — (phase 6 only) mean cycles per scheduling decision under
+               this policy, captured from the tail of the log via the
+               `cycles` shell command.
 
 For the "concurrent" workload, the report covers BOTH cpu_bound (pid 7)
 and io_bound (pid 8) on separate rows.
 """
 
-import csv, os, re, sys
+import argparse, os, re, sys
 from collections import defaultdict
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PHASE5 = os.path.join(ROOT, "results", "phase5")
-
-POLICIES  = ["rr", "mlfq", "v1", "v2", "bandit"]
-WORKLOADS = ["cpu_bound", "io_bound", "mixed", "bursty", "forker", "concurrent"]
+ROOT     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+POLICIES = ["rr", "mlfq", "v1", "v2", "bandit"]
 
 ANSI_RE  = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 TRACE_RE = re.compile(
     r"^TRACE\s+tick=0x([0-9a-fA-F]+)\s+pid=0x([0-9a-fA-F]+)\s+ev=(\w+)"
 )
+CYCLES_RE = re.compile(
+    r"^CYCLES\s+policy=(\w+)\s+decisions=(\d+)\s+cycles=(\d+)\s+cyc_per_dec=(\d+)"
+)
 
 
 def parse_log(path):
+    """Return (trace_records, cycles_by_policy).
+
+    cycles_by_policy is { policy_name: cyc_per_dec_int } populated from
+    the most recent CYCLES dump in the log (typically just before the
+    final QEMU exit). Empty if the log predates Phase 6.
+    """
     records = []
+    cycles = {}
     with open(path, "r", errors="replace") as fh:
         for raw in fh:
             stripped = ANSI_RE.sub("", raw).replace("\r", "")
             for line in stripped.split("\n"):
-                m = TRACE_RE.match(line.strip())
+                stripped_line = line.strip()
+                m = TRACE_RE.match(stripped_line)
                 if m:
                     records.append((int(m.group(1), 16),
                                     int(m.group(2), 16),
                                     m.group(3)))
-    return records
+                    continue
+                c = CYCLES_RE.match(stripped_line)
+                if c:
+                    cycles[c.group(1)] = int(c.group(4))
+    return records, cycles
 
 
 def per_pid_metrics(records, pid):
@@ -63,51 +83,76 @@ def per_pid_metrics(records, pid):
     return counts, run_ticks
 
 
-def compare_workload(workload):
-    """Print a per-policy table for one workload."""
+def compare_workload(workload, phase_dir, show_cycles):
     print(f"### {workload}")
-    print("| sched | events | preempts | sleeps | demotes | run_ticks |")
-    print("|---|---|---|---|---|---|")
+    if show_cycles:
+        print("| sched | events | preempts | sleeps | demotes | run_ticks | cyc/dec |")
+        print("|---|---|---|---|---|---|---|")
+    else:
+        print("| sched | events | preempts | sleeps | demotes | run_ticks |")
+        print("|---|---|---|---|---|---|")
+
     for s in POLICIES:
-        log = os.path.join(PHASE5, f"{s}_{workload}.log")
+        log = os.path.join(phase_dir, f"{s}_{workload}.log")
         if not os.path.exists(log):
-            print(f"| {s} | - | - | - | - | - |")
+            cells = "- | " * (6 if show_cycles else 5)
+            print(f"| {s} | {cells}")
             continue
-        records = parse_log(log)
+
+        records, cycles_by_policy = parse_log(log)
+        cyc = cycles_by_policy.get(s, None)
+        cyc_str = str(cyc) if cyc is not None else "-"
+
         if not records:
-            print(f"| {s} | 0 | - | - | - | - |")
+            extra = f" | {cyc_str}" if show_cycles else ""
+            print(f"| {s} | 0 | - | - | - | -{extra} |")
             continue
 
         if workload == "concurrent":
-            # Show cpu_bound + io_bound rows.
             cpu_counts, cpu_runt = per_pid_metrics(records, 7)
-            io_counts, io_runt   = per_pid_metrics(records, 8)
+            io_counts,  io_runt  = per_pid_metrics(records, 8)
+            cpu_extra = f" | {cyc_str}" if show_cycles else ""
+            io_extra  = " | --"        if show_cycles else ""
             print(f"| {s} (cpu) | {len(records)} | {cpu_counts['PREEMPT']} | "
-                  f"{cpu_counts['SLEEP']} | {cpu_counts['DEMOTE']} | {cpu_runt} |")
+                  f"{cpu_counts['SLEEP']} | {cpu_counts['DEMOTE']} | {cpu_runt}"
+                  f"{cpu_extra} |")
             print(f"| {s} (io)  | -- | {io_counts['PREEMPT']} | "
-                  f"{io_counts['SLEEP']} | {io_counts['DEMOTE']} | {io_runt} |")
+                  f"{io_counts['SLEEP']} | {io_counts['DEMOTE']} | {io_runt}"
+                  f"{io_extra} |")
         else:
-            # Single-workload: identify the workload pid via the SPAWN
-            # event. After `trace clear`, the only SPAWN should be the
-            # workload itself (or the first child for forker).
             pid = next((p for _, p, ev in records
                         if ev == "SPAWN" and p != 0), None)
             if pid is None:
-                print(f"| {s} | {len(records)} | - | - | - | - |")
+                extra = f" | {cyc_str}" if show_cycles else ""
+                print(f"| {s} | {len(records)} | - | - | - | -{extra} |")
                 continue
             counts, runt = per_pid_metrics(records, pid)
+            extra = f" | {cyc_str}" if show_cycles else ""
             print(f"| {s} | {len(records)} | {counts['PREEMPT']} | "
-                  f"{counts['SLEEP']} | {counts['DEMOTE']} | {runt} |")
+                  f"{counts['SLEEP']} | {counts['DEMOTE']} | {runt}{extra} |")
     print()
 
 
 def main():
-    if not os.path.isdir(PHASE5):
-        print(f"compare_policies: {PHASE5} not found. "
-              f"Run `bash tools/run_experiments.sh 5` first.", file=sys.stderr)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--phase", type=int, default=5,
+                    help="phase to compare (5 or 6; default 5)")
+    args = ap.parse_args()
+
+    phase_dir = os.path.join(ROOT, "results", f"phase{args.phase}")
+    if not os.path.isdir(phase_dir):
+        print(f"compare_policies: {phase_dir} not found. "
+              f"Run `bash tools/run_experiments.sh {args.phase}` first.",
+              file=sys.stderr)
         return 1
-    for w in WORKLOADS:
-        compare_workload(w)
+
+    workloads = ["cpu_bound", "io_bound", "mixed", "bursty", "forker", "concurrent"]
+    if args.phase >= 6:
+        workloads += ["flipper", "wolf"]
+
+    show_cycles = args.phase >= 6
+    for w in workloads:
+        compare_workload(w, phase_dir, show_cycles)
     return 0
 
 

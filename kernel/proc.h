@@ -118,6 +118,33 @@ typedef struct proc {
      * doesn't permanently lock out untried options). */
     uint32_t v3_visits;
 
+    /* Phase 7 V2: ring of recent burst end reasons.
+     *
+     * Phase 6 found V2's classifier sticks at IO_BOUND on phase changes
+     * because it reads lifetime sleep_calls / voluntary_yields /
+     * involuntary_preempts. After 10 sleeps a workload is permanently
+     * IO_BOUND even if its behavior flips. Fix: classify from the last
+     * K=10 bursts only. v2_classify scans the most-recent K'=5 entries
+     * (window-within-window) so adaptation completes inside ~3 cpu
+     * preempts on flipper, matching MLFQ's demote ladder.
+     *
+     * Encoding: one byte per entry. 0=SLEEP, 1=YIELD, 2=PREEMPT, 3=EXIT,
+     * 4=OTHER. cursor advances on each v2_on_burst_end write; fill is
+     * capped at sizeof(burst_window) so the classifier can detect a
+     * partly-filled ring on freshly-spawned procs.
+     *
+     * v2_last_yields / v2_last_preempts are snapshots of the lifetime
+     * counters at the last v2_on_burst_end call — used to detect which
+     * counter ticked during the just-closed burst (yield vs preempt
+     * leave the same RUNNABLE state, so state alone can't tell us).
+     *
+     * Untouched under RR/MLFQ/V1/V3 — only V2 reads or writes these. */
+    uint8_t burst_window[10];
+    uint8_t burst_window_cursor;
+    uint8_t burst_window_fill;
+    uint32_t v2_last_yields;
+    uint32_t v2_last_preempts;
+
     /*
      * Scheduler-specific accounting fields are added as each scheduler phase
      * needs them. See SPEC.md §4 Phase 3/5 for the staging plan.

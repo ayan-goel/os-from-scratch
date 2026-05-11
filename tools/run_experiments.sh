@@ -6,6 +6,14 @@
 # Phase 5 (RR + MLFQ + V1/V2/V3): 5 sched × 6 workloads at q=10  = 30 runs.
 #                                  workloads include "concurrent" =
 #                                  cpu_bound + io_bound running together.
+# Phase 6 (eval only — same 5 scheds): 5 sched × 8 workloads at q=10 = 40 runs.
+#                                  workloads add "flipper" (I/O→CPU phase
+#                                  change) and "wolf" (yield-spam then long
+#                                  burst — MLFQ gaming attack). Per SPEC.md
+#                                  §Phase 6 no scheduler bodies change; the
+#                                  matrix exists only for evaluation. Each
+#                                  log captures the final `cycles` dump for
+#                                  per-decision overhead extraction.
 #
 # For every (sched, quantum, workload), boot the kernel, wait for
 # init's boot-time children to finish, set the quantum, switch to
@@ -34,7 +42,9 @@ case "${PHASE}" in
     3)  OUT="${ROOT}/results/phase3"; SCHEDS=(rr)                    ; QUANTA=(1 10 100); WORKLOADS=(cpu_bound io_bound mixed bursty forker) ;;
     4)  OUT="${ROOT}/results/phase4"; SCHEDS=(rr mlfq)               ; QUANTA=(1 10 100); WORKLOADS=(cpu_bound io_bound mixed bursty forker) ;;
     5)  OUT="${ROOT}/results/phase5"; SCHEDS=(rr mlfq v1 v2 bandit)  ; QUANTA=(10)      ; WORKLOADS=(cpu_bound io_bound mixed bursty forker concurrent) ;;
-    *)  echo "run_experiments: unknown phase '${PHASE}' (try 3, 4, or 5)" >&2; exit 1 ;;
+    6)  OUT="${ROOT}/results/phase6"; SCHEDS=(rr mlfq v1 v2 bandit)  ; QUANTA=(10)      ; WORKLOADS=(cpu_bound io_bound mixed bursty forker concurrent flipper wolf) ;;
+    7)  OUT="${ROOT}/results/phase7"; SCHEDS=(rr mlfq v1 v2 bandit)  ; QUANTA=(10)      ; WORKLOADS=(cpu_bound io_bound mixed bursty forker concurrent flipper wolf) ;;
+    *)  echo "run_experiments: unknown phase '${PHASE}' (try 3, 4, 5, 6, or 7)" >&2; exit 1 ;;
 esac
 
 mkdir -p "${OUT}"
@@ -48,7 +58,12 @@ fi
 BOOT_WAIT=8        # let init's auto-spawn (cpu_bound + io_bound + hello) finish
 RUN_TIME=6         # workload runtime budget after `run` is issued
 TAIL_WAIT=2        # let final trace events flush before exit
-TOTAL=$(( BOOT_WAIT + RUN_TIME + TAIL_WAIT + 4 ))   # +4 buffer
+# Phase 6 flipper/wolf need extra time: Phase A (10 sleeps × 1 tick = ~100 ms)
+# plus Phase B (5 rounds of tight compute @ ~1.5 s each = ~7.5 s). 12 s budget
+# leaves enough headroom for the phase change to be visible in the trace.
+RUN_TIME_LONG=12
+TOTAL=$(( BOOT_WAIT + RUN_TIME + TAIL_WAIT + 4 ))   # +4 buffer (short workloads)
+TOTAL_LONG=$(( BOOT_WAIT + RUN_TIME_LONG + TAIL_WAIT + 4 ))
 
 run_one() {
     local s="$1" q="$2" w="$3"
@@ -57,7 +72,20 @@ run_one() {
         3)  stem="q${q}_${w}"            ;;
         4)  stem="${s}_q${q}_${w}"       ;;
         5)  stem="${s}_${w}"             ;;   # single quantum
+        6)  stem="${s}_${w}"             ;;   # single quantum, evaluation-only
+        7)  stem="${s}_${w}"             ;;   # single quantum, after V2 fix
     esac
+
+    # flipper / wolf have two phases (I/O-bound → CPU-bound) and need
+    # extra wall time to complete. Other workloads use the short budget.
+    local run_time alarm_total
+    if [[ "${w}" == "flipper" || "${w}" == "wolf" ]]; then
+        run_time="${RUN_TIME_LONG}"
+        alarm_total="${TOTAL_LONG}"
+    else
+        run_time="${RUN_TIME}"
+        alarm_total="${TOTAL}"
+    fi
     local raw="${OUT}/${stem}.raw"
     local log="${OUT}/${stem}.log"
 
@@ -90,8 +118,11 @@ run_one() {
         printf 'trace clear\n'
         sleep 1
         eval "${spawn_block}"
-        sleep "${RUN_TIME}"
+        sleep "${run_time}"
         printf 'trace 1024\n'
+        sleep 1
+        # Phase 6: capture the per-decision overhead snapshot into the log.
+        printf 'cycles\n'
         sleep "${TAIL_WAIT}"
         printf '\x01x'         # Ctrl-A X — QEMU exits cleanly
     } | perl -e "
@@ -99,7 +130,7 @@ run_one() {
         \$SIG{ALRM}=sub{ kill 'KILL', \$pid; exit };
         \$pid = open(Q, '-|', 'qemu-system-riscv64 -machine virt -cpu rv64 ' .
                               '-m 128M -nographic -bios none -kernel ${KERNEL} 2>&1');
-        alarm ${TOTAL};
+        alarm ${alarm_total};
         while (<Q>) { print }
         alarm 0;
     " > "${raw}" || true

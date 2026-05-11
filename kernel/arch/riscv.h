@@ -28,6 +28,15 @@
 #define CSR_CLEAR(csr, bits) \
     __asm__ volatile("csrc " #csr ", %0" :: "rK"(bits) : "memory")
 
+/* Read the cycle CSR. Used by Phase 6 to measure per-decision scheduler
+ * overhead — read at sched entry and after pick_next returns. M-mode
+ * cycle counter increments every cycle (verified at boot on QEMU TCG). */
+static inline uint64_t rdcycle(void) {
+    uint64_t v;
+    __asm__ volatile("csrr %0, cycle" : "=r"(v));
+    return v;
+}
+
 /* ── mstatus / mie bit positions ────────────────────────────────────────────
  * Used when enabling/disabling interrupts and when dropping to user mode.
  */

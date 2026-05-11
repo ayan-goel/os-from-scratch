@@ -104,7 +104,47 @@ static void cmd_help(void) {
     out_puts("  sched [name]      show/swap scheduler (rr | mlfq | v1 | v2 | bandit)\n");
     out_puts("  quantum [ms]      show/set timer quantum (stub)\n");
     out_puts("  trace [n|clear]   dump last n events (default 64), or clear ring\n");
+    out_puts("  cycles            per-policy mean cycles/decision (Phase 6)\n");
     out_puts("  clear             clear the shell output panel\n");
+}
+
+/*
+ * cmd_cycles — Phase 6 per-decision overhead readout.
+ *
+ * Reads sched_decisions_total / sched_cycles_total (populated by
+ * scheduler() in proc.c via rdcycle sampling) and prints mean
+ * cycles/decision per policy. The accumulators are global and
+ * cross-policy (one row per policy across the run), so a process
+ * that swaps policies mid-run contributes to whichever policy was
+ * active for each decision.
+ *
+ * Output is machine-parseable: a header line, then one
+ * "<name> <decisions> <cycles> <mean>" line per policy. tools/
+ * compare_policies.py parses this off the log tail.
+ */
+static void cmd_cycles(void) {
+    /* Write the data to raw UART so the harness can parse it from
+     * the QEMU stdout stream without competing with TUI redraws.
+     * Format: one CYCLES line per policy, easy to grep.
+     *   CYCLES policy=<name> decisions=<n> cycles=<n> cyc_per_dec=<n>
+     */
+    uart_putc('\n');
+    for (int i = 0; i < SCHED_POLICY_COUNT; i++) {
+        uart_puts("CYCLES policy=");
+        uart_puts(sched_policy_name_by_index(i));
+        uart_puts(" decisions=");
+        uart_putdec(sched_decisions_total[i]);
+        uart_puts(" cycles=");
+        uart_putdec(sched_cycles_total[i]);
+        uart_puts(" cyc_per_dec=");
+        uint64_t mean = (sched_decisions_total[i] > 0)
+                      ? sched_cycles_total[i] / sched_decisions_total[i]
+                      : 0;
+        uart_putdec(mean);
+        uart_putc('\n');
+    }
+    /* TUI ack so the user knows the dump happened. */
+    out_puts("cycles: 5 policy rows (see stdout)\n");
 }
 
 static void cmd_clear(void) {
@@ -559,6 +599,7 @@ static void shell_exec_command(char *line) {
     if (str_eq(line, "sched"))   { cmd_sched(arg);    return; }
     if (str_eq(line, "quantum")) { cmd_quantum(arg);  return; }
     if (str_eq(line, "trace"))   { cmd_trace(arg);    return; }
+    if (str_eq(line, "cycles"))  { cmd_cycles();      return; }
 
     out_puts("unknown command: ");
     out_puts(line);

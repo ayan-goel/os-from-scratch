@@ -99,6 +99,26 @@ extern const uint16_t mlfq_allotment[MLFQ_LEVELS];
 sched_policy_t *sched_policy_by_name(const char *name);
 
 /*
+ * Phase 6: per-policy decision overhead accumulators.
+ *
+ * SCHED_POLICY_COUNT — number of compiled policies (rr/mlfq/v1/v2/bandit).
+ * sched_decisions_total[i] — total pick_next calls counted under policy i.
+ * sched_cycles_total[i]    — sum of cycles spent in pick_next under policy i.
+ *
+ * sched_policy_index(pol)        — index of a policy by pointer; -1 if unknown.
+ * sched_policy_name_by_index(i)  — short name ("rr", "mlfq", ...).
+ *
+ * The two arrays live in sched.c. scheduler() in proc.c is the sole
+ * writer; cmd_cycles in shell.c is the sole reader. No policy body
+ * touches these — they are read-only sampling per SPEC.md §Phase 6.
+ */
+#define SCHED_POLICY_COUNT 5
+extern uint64_t sched_decisions_total[SCHED_POLICY_COUNT];
+extern uint64_t sched_cycles_total[SCHED_POLICY_COUNT];
+int         sched_policy_index(const sched_policy_t *pol);
+const char *sched_policy_name_by_index(int idx);
+
+/*
  * V3 introspection accessors — read-only, used by the TUI to render
  * the WEIGHTS row when sched_bandit is active.
  *

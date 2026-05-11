@@ -559,7 +559,23 @@ void scheduler(void) {
 
         int found = 0;
         proc_t *p;
-        while ((p = active_sched->pick_next()) != NULL) {
+        /*
+         * Phase 6: sample rdcycle around each pick_next() call to
+         * measure per-policy decision overhead. Counters live in
+         * sched.c; we only read CSRs and accumulate here so policy
+         * bodies stay byte-identical to Phase 5 (SPEC.md §Phase 6).
+         * The policy-index lookup is O(1) (5 pointer compares).
+         */
+        for (;;) {
+            int pol_idx = sched_policy_index(active_sched);
+            uint64_t cyc_before = rdcycle();
+            p = active_sched->pick_next();
+            uint64_t cyc_after  = rdcycle();
+            if (pol_idx >= 0) {
+                sched_decisions_total[pol_idx] += 1;
+                sched_cycles_total[pol_idx]    += (cyc_after - cyc_before);
+            }
+            if (p == NULL) break;
             found = 1;
             p->state = RUNNING;
             if (p->first_run_tick == 0)
