@@ -6,7 +6,7 @@ A RISC-V 64-bit kernel written in C from bare metal. No libc, no malloc, no FP, 
 
 ## Headline result
 
-The strongest learning policy, an online behavioral classifier with windowed input counters, **beats MLFQ on every workload in the matrix** and matches its phase-change adaptation speed of 3 bursts on the `flipper` adversarial workload. A more ambitious contextual-bandit scheduler loses on cpu-heavy workloads, because UCB exploration costs eat the test budget. The full numbers, figures, and discussion are in [writeup/main.pdf](writeup/main.pdf). Per-phase notes are in [notes/](notes/).
+The strongest learning policy, an online behavioral classifier with windowed input counters, **beats MLFQ on every workload in the matrix** and matches its phase-change adaptation speed of 3 bursts on the `flipper` adversarial workload. A more ambitious contextual-bandit scheduler loses on cpu-heavy workloads, because UCB exploration costs eat the test budget. The full numbers, figures, and discussion are in [writeup/main.pdf](writeup/main.pdf).
 
 ## What's in it
 
